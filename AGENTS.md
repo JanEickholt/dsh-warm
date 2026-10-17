@@ -47,6 +47,11 @@ covers what it does and why; this file covers what silently breaks.
 - `st.epoch` guards pings still in flight when their state is superseded
   (new capture, idle, disposal): they still journal (budget honesty) but
   never count `pings` or re-arm a timer.
+- `st.pingEpoch` marks a ping in flight for the current epoch: its settle
+  path re-arms, so `armTimer` must not schedule meanwhile (a tool starting
+  mid-ping would otherwise catch up off the not-yet-counted slot and
+  double-dispatch). The budget gate counts in-flight pings for the same
+  reason across sessions.
 - `journal.pingsToday()` must self-rollover at UTC midnight: the budget
   gates call it before `record()` can ever run again, so `record()`-only
   rollover freezes an exhausted budget for the process lifetime.

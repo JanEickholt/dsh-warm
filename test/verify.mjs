@@ -667,4 +667,177 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   warmer.dispose()
 }
 
+// --- 23. Tool re-entry while a ping is in flight: no duplicate dispatch --------
+{
+  // Sequential tool calls of one response: tool A settles while its ping is
+  // still in flight and tool B starts. The in-flight ping's settle re-arms, so
+  // tool B must not schedule a catch-up ping off the not-yet-counted slot.
+  const llmGate = { resolve: null }
+  const llmGatePromise = new Promise((r) => { llmGate.resolve = r })
+  const dispatches = []
+  const llm = {
+    stream: async function* (options) {
+      dispatches.push(options)
+      await llmGatePromise
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+    },
+  }
+  const { warmer, clock, journal } = makeWarmer({}, {}, { llm })
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gateA = { resolve: null }
+  const toolA = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gateA.resolve = r }); return 'a' })
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'ping 1 in flight during tool A')
+  gateA.resolve()
+  await toolA
+  const gateB = { resolve: null }
+  const toolB = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gateB.resolve = r }); return 'b' })
+  clock.advance(5_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'tool B does not double-dispatch while ping 1 is in flight')
+  llmGate.resolve()
+  await settle()
+  assert.equal(journal.entries.length, 1)
+  clock.advance(235_000)
+  await settle()
+  assert.equal(dispatches.length, 2, 'ping 2 lands on the grid slot after ping 1 settles')
+  gateB.resolve()
+  await toolB
+  warmer.dispose()
+}
+
+// --- 24. Budget counts in-flight pings: concurrent pings cannot overshoot ------
+{
+  const llmGate = { resolve: null }
+  const llmGatePromise = new Promise((r) => { llmGate.resolve = r })
+  const dispatches = []
+  const llm = {
+    stream: async function* (options) {
+      dispatches.push(options)
+      await llmGatePromise
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+    },
+  }
+  const { warmer, clock } = makeWarmer({ dailyPingBudget: 1, maxConcurrentPings: 2 }, {}, { llm })
+  for (const id of ['s1', 's2']) {
+    warmer.onAgentStatus({ agent: { id }, status: 'running' })
+    warmer.onLlmStream({ ...conversationRequest, sessionId: id }, () => [])[Symbol.iterator]()
+  }
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const tools = Promise.all(['s1', 's2'].map((id) => warmer.onToolsExecute({ agent: { id }, name: 'bash' }, async () => { await gatePromise; return 'ok' })))
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'budget of 1 admits exactly one dispatch even with two due sessions')
+  llmGate.resolve()
+  gate.resolve()
+  await tools
+  warmer.dispose()
+}
+
+// --- 25. Budget-exhausted warning re-fires on the next exhausted day ----------
+{
+  let spent = 300
+  const warns = []
+  const { warmer, clock, dispatches } = makeWarmer({}, { pingsToday: () => spent }, { warn: (m) => warns.push(m) })
+  const budgetWarns = () => warns.filter((m) => m.includes('daily ping budget')).length
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolA = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  assert.equal(budgetWarns(), 1, 'day 1: budget exhausted warns')
+  spent = 0 // UTC midnight: the journal rolled the counter over.
+  const toolB = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  spent = 300 // Day 2 exhausted before the armed ping fires.
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 0)
+  assert.equal(budgetWarns(), 2, 'day 2: exhaustion warns again instead of staying silent forever')
+  gate.resolve()
+  await Promise.all([toolA, toolB])
+  warmer.dispose()
+}
+
+// --- 26. Captured call already aborted: no ping, no budget burned -------------
+{
+  const dispatches = []
+  const llm = {
+    stream: async function* (options) {
+      dispatches.push(options)
+      yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'aborted' } } }
+    },
+  }
+  const { warmer, clock, journal } = makeWarmer({}, {}, { llm, combineSignals: () => ({ chained: true }) })
+  const controller = new AbortController()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream({ ...conversationRequest, signal: controller.signal }, () => [])[Symbol.iterator]()
+  controller.abort()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  for (let i = 0; i < 3; i++) {
+    clock.advance(240_000)
+    await settle()
+  }
+  assert.equal(dispatches.length, 0, 'an aborted call is never replayed')
+  assert.equal(journal.entries.length, 0, 'no counted entries for pings that would abort instantly')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 27. Prefix size: lazy for unwarmed providers, counts non-string system ---
+{
+  let serialized = 0
+  const probe = { role: 'user', content: 'x'.repeat(20_000), toJSON() { serialized++; return { role: this.role, content: this.content } } }
+  const { warmer, clock, dispatches } = makeWarmer()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream({ ...conversationRequest, provider: 'deepseek', messages: [probe] }, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolA = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  assert.equal(serialized, 0, 'requests to unwarmed providers are never serialized for the size gate')
+
+  // Block-array system prompt: its text counts toward the prefix size.
+  warmer.onLlmStream({
+    ...conversationRequest,
+    messages: [{ role: 'user', content: 'hi' }],
+    system: [{ type: 'text', text: 's'.repeat(20_000) }],
+  }, () => [])[Symbol.iterator]()
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'a large block-array system prompt clears minPrefixChars')
+  gate.resolve()
+  await toolA
+  warmer.dispose()
+}
+
+// --- 28. Real journal: rolls past ROLL_BYTES within one process lifetime -------
+{
+  const { openJournal } = await import('../lib/journal.js')
+  const { mkdtempSync, rmSync, existsSync, statSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-roll-'))
+  try {
+    const nowMs = Date.UTC(2026, 9, 17, 12, 0, 0)
+    const journal = openJournal(tmp, { now: () => nowMs })
+    const pad = 'p'.repeat(64 * 1024)
+    // 5 MB roll threshold: ~90 x 64 KB lines cross it without a restart.
+    for (let i = 0; i < 90; i++) journal.record({ counted: true, pad })
+    assert.ok(existsSync(join(tmp, 'warm.jsonl.2026-10-17')), 'journal rolled mid-process')
+    assert.ok(statSync(join(tmp, 'warm.jsonl')).size < 5 * 1024 * 1024, 'live journal restarted small')
+    assert.equal(journal.pingsToday(), 90, 'roll does not touch the in-memory budget counter')
+    journal.close()
+    const reopened = openJournal(tmp, { now: () => nowMs })
+    assert.equal(reopened.pingsToday(), 90, 'boot rescan counts today\'s entries in the rolled file too')
+    reopened.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

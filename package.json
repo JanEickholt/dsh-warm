@@ -1,0 +1,43 @@
+{
+  "name": "dsh-warm",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness host plugin: prompt-cache warmer. While a session's agent loop is blocked inside a tool execution (bash, wait_agent, job_output, ...), re-dispatches the session's last conversation request through the llm waterfall with max_tokens=1 every interval so the provider's prompt-cache prefix stays warm; never warms idle sessions or user-input tools. Journal + budget at $DSH_HOME/storages/dsh-warm/.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/verify.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JanEickholt/dsh-warm.git"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "prompt-cache",
+    "cache-warming",
+    "plugin",
+    "host-plugin"
+  ]
+}

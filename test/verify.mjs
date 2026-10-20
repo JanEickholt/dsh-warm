@@ -67,7 +67,7 @@ const baseConfig = {
   dryRun: false,
   maxPings: 5,
   providers: {
-    mistral: { intervalMs: 240_000, ttlMs: 302_000 },
+    mistral: { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 },
   },
   excludeTools: ['ask_user_question'],
   minPrefixChars: 12_000,
@@ -120,9 +120,12 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'result' })
 
-  clock.advance(240_000)
+  clock.advance(241_000)
   await settle()
-  assert.equal(dispatches.length, 1, 'first ping at lastRequestAt + interval')
+  assert.equal(dispatches.length, 0, 'no ping one second before the anchored due')
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'first ping at refreshBase + ttl - margin')
   const ping = dispatches[0]
   assert.equal(ping.maxTokens, 1, 'ping caps output at one token')
   assert.equal(ping.messages, conversationRequest.messages, 'ping shares the frozen messages reference byte-identically')
@@ -133,9 +136,9 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   assert.equal(journal.entries[0].counted, true)
   assert.equal(journal.entries[0].cacheReadTokens, 1152, 'journal records the provider hit')
 
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
-  assert.equal(dispatches.length, 2, 'second ping on the next grid slot')
+  assert.equal(dispatches.length, 2, 'second ping on the next anchored slot (the hit moved the base to 242s)')
 
   gate.resolve()
   await toolPromise
@@ -154,8 +157,11 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'wait_agent' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, '241s: nothing before the anchored due (the 240s grid slot is dead)')
   for (let i = 0; i < 7; i++) {
-    clock.advance(240_000)
+    clock.advance(242_000)
     await settle()
   }
   assert.equal(dispatches.length, 5, 'ping cap respected')
@@ -172,14 +178,17 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
-  clock.advance(240_000)
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, 'no ping before the anchored due')
+  clock.advance(1_000)
   await settle()
   clock.advance(120_000)
   warmer.onLlmStream({ ...conversationRequest, messages: [...bigMessages, { role: 'assistant', content: 'next' }] }, () => [])[Symbol.iterator]()
   clock.advance(120_000)
   await settle()
   assert.equal(dispatches.length, 1, 'grid restarts from the new request, not the old one')
-  clock.advance(120_000)
+  clock.advance(122_000)
   await settle()
   assert.equal(dispatches.length, 2)
   gate.resolve()
@@ -229,7 +238,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 0, 'dry-run never dispatches')
   assert.equal(journal.entries.length, 1)
@@ -321,18 +330,21 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
     warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gates[0].promise; return 'ok' }),
     warmer.onToolsExecute({ agent: { id: 's2' }, name: 'bash' }, async () => { await gates[1].promise; return 'ok' }),
   ])
-  clock.advance(240_000)
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, 'one second before the shared anchored due nothing fires')
+  clock.advance(1_000)
   await settle()
   assert.equal(dispatches.length, 1, 'concurrency cap: second session deferred')
   clock.advance(5_000)
   await settle()
   assert.equal(dispatches.length, 2, 'deferred session pings after the retry delay')
-  clock.advance(235_000)
+  clock.advance(242_000)
   await settle()
-  assert.equal(dispatches.length, 3, 'shared grid tick: cap serializes the second session again')
+  assert.equal(dispatches.length, 3, 'shared anchored tick: cap serializes the second session again')
   clock.advance(5_000)
   await settle()
-  assert.equal(dispatches.length, 4, 'deferred ping lands; both sessions stay on their grids')
+  assert.equal(dispatches.length, 4, 'deferred ping lands; both sessions stay on their anchored schedules')
   for (const g of gates) g.resolve()
   await tools
   warmer.dispose()
@@ -378,14 +390,14 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer2.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 0)
   assert.equal(journal.entries.length, 1)
   assert.equal(journal.entries[0].ok, false)
   assert.match(journal.entries[0].error, /503/)
   assert.equal(journal.entries[0].counted, true, 'a real dispatch attempt consumes budget even on failure')
-  clock.advance(240_000)
+  clock.advance(30_000)
   await settle()
   assert.equal(journal.entries.length, 2, 'chain continues after a failure')
   gate.resolve()
@@ -465,7 +477,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
     },
   }))
   const cfg2 = loadConfig(join(tmp, 'b'), warn)
-  assert.deepEqual(cfg2.providers.deepseek, { intervalMs: 300_000, maxPings: 3 }, 'custom provider entry kept verbatim')
+  assert.deepEqual(cfg2.providers.deepseek, { intervalMs: 300_000, maxPings: 3, marginMs: 60_000 }, 'custom provider entry kept verbatim (marginMs always resolves)')
   assert.equal(cfg2.providers.broken, undefined, 'non-numeric intervalMs drops the entry')
   assert.equal(cfg2.providers.spotty, undefined, 'sub-minute interval drops the entry')
   assert.ok(warnings.some((m) => m.includes('providers["broken"]')), 'dropped entry warns loudly')
@@ -475,7 +487,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   mkdirSync(join(tmp, 'c'), { recursive: true })
   writeFileSync(join(tmp, 'c', 'config.json'), JSON.stringify({ warmProviders: ['mistral', 'opencode-go'], intervalMs: 200_000 }))
   const cfg4 = loadConfig(join(tmp, 'c'), warn)
-  assert.deepEqual(cfg4.providers, { mistral: { intervalMs: 200_000, ttlMs: 302_000 }, 'opencode-go': { intervalMs: 200_000 } }, 'legacy warmProviders+intervalMs migrate to one table; known providers adopt the measured ttlMs default')
+  assert.deepEqual(cfg4.providers, { mistral: { intervalMs: 200_000, ttlMs: 302_000, marginMs: 60_000 }, 'opencode-go': { intervalMs: 200_000, marginMs: 60_000 } }, 'legacy warmProviders+intervalMs migrate to one table; known providers adopt the measured ttlMs default')
   assert.ok(warnings.some((m) => m.includes('migrated')), 'migration warns')
 
   // Prototype-chain names cannot sneak in as providers: the warmer's
@@ -547,7 +559,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
   const toolGate = { resolve: null }
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { toolGate.resolve = r }); return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 1, 'epoch-1 ping is in flight')
   // Second conversation request supersedes the captured state mid-flight.
@@ -556,13 +568,19 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   await settle()
   assert.equal(journal.entries.length, 1)
   assert.equal(journal.entries[0].counted, true, 'the superseded ping was really dispatched: budget stays honest')
-  // New epoch grid: first ping due one interval after the new capture, not two.
-  clock.advance(240_000)
+  // New epoch grid: first ping due one anchored slot after the new capture, not two.
+  clock.advance(241_000)
   await settle()
-  assert.equal(dispatches.length, 2, 'new epoch pings on its own grid (no slot stolen by the old ping)')
-  clock.advance(240_000)
+  assert.equal(dispatches.length, 1, '483s: one second before the new epoch\'s due nothing fires')
+  clock.advance(1_000)
   await settle()
-  assert.equal(dispatches.length, 3, 'second new-epoch ping keeps the 240s spacing')
+  assert.equal(dispatches.length, 2, 'new epoch pings on its own anchored schedule (no slot stolen by the old ping)')
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 2, '725s: the hit moved the due to 726s')
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 3, 'second new-epoch ping keeps the 242s spacing')
   toolGate.resolve()
   await toolPromise
   warmer.dispose()
@@ -586,7 +604,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
   const toolGate = { resolve: null }
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { toolGate.resolve = r }); return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 1, 'ping in flight when the session dies')
   warmer.onSessionDisposed({ id: 's1' })
@@ -619,7 +637,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(journal.entries.length, 1)
   assert.equal(journal.entries[0].ok, false, 'a 503 finish chunk is a failure, not a success')
@@ -656,7 +674,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 1)
   assert.equal(dispatches[0].signal.chained, true, 'payload carries the combined signal')
@@ -688,7 +706,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
   const gateA = { resolve: null }
   const toolA = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gateA.resolve = r }); return 'a' })
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 1, 'ping 1 in flight during tool A')
   gateA.resolve()
@@ -701,9 +719,12 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   llmGate.resolve()
   await settle()
   assert.equal(journal.entries.length, 1)
-  clock.advance(235_000)
+  clock.advance(233_000) // t=480: the old 240-grid due lands here
   await settle()
-  assert.equal(dispatches.length, 2, 'ping 2 lands on the grid slot after ping 1 settles')
+  assert.equal(dispatches.length, 1, '480s is still before the anchored due 484')
+  clock.advance(4_000)
+  await settle()
+  assert.equal(dispatches.length, 2, 'ping 2 lands on the anchored slot after ping 1 settles')
   gateB.resolve()
   await toolB
   warmer.dispose()
@@ -729,7 +750,10 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   const gate = { resolve: null }
   const gatePromise = new Promise((r) => { gate.resolve = r })
   const tools = Promise.all(['s1', 's2'].map((id) => warmer.onToolsExecute({ agent: { id }, name: 'bash' }, async () => { await gatePromise; return 'ok' })))
-  clock.advance(240_000)
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, '241s: nothing before the anchored due')
+  clock.advance(1_000)
   await settle()
   assert.equal(dispatches.length, 1, 'budget of 1 admits exactly one dispatch even with two due sessions')
   llmGate.resolve()
@@ -753,7 +777,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
   spent = 0 // UTC midnight: the journal rolled the counter over.
   const toolB = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
   spent = 300 // Day 2 exhausted before the armed ping fires.
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 0)
   assert.equal(budgetWarns(), 2, 'day 2: exhaustion warns again instead of staying silent forever')
@@ -808,7 +832,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
     messages: [{ role: 'user', content: 'hi' }],
     system: [{ type: 'text', text: 's'.repeat(20_000) }],
   }, () => [])[Symbol.iterator]()
-  clock.advance(240_000)
+  clock.advance(242_000)
   await settle()
   assert.equal(dispatches.length, 1, 'a large block-array system prompt clears minPrefixChars')
   gate.resolve()
@@ -848,18 +872,18 @@ const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
 
 /** Warmer + real stats engine sharing one fake clock; stats.json in a tmp dir. */
-const statsHarness = (configOverrides = {}, llmFactory = makeLlm) => {
+const statsHarness = (configOverrides = {}, llmFactory = makeLlm, debug = null) => {
   const clock = fakeClock()
   const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-stats-'))
   const config = { ...baseConfig, ...configOverrides }
-  const stats = createStatsEngine({ storageDir: tmp, config, now: clock.now, warn: () => {} })
+  const stats = createStatsEngine({ storageDir: tmp, config, now: clock.now, warn: () => {}, debug })
   const factory = llmFactory()
   const { llm, dispatches, ...llmExtras } = factory
   const journal = makeJournal()
   const warmer = createWarmer({
     llm, config, journal, stats,
     now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
-    signal: (ms) => ({ timeoutMs: ms }), warn: () => {},
+    signal: (ms) => ({ timeoutMs: ms }), warn: () => {}, debug,
   })
   return { warmer, clock, dispatches, journal, stats, tmp, llmExtras }
 }
@@ -876,9 +900,9 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
-    h.clock.advance(60_000)
+    h.clock.advance(58_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const agg = h.stats.snapshot().allTime
     assert.equal(agg.warms, 1, 'one ping dispatched')
@@ -886,6 +910,7 @@ const gateTool = (warmer, sid = 's1') => {
     assert.equal(agg.expired, 0)
     assert.equal(agg.noFollowup, 0)
     assert.equal(agg.savedCacheTokens, 0, 'no necessary ping means no credit')
+    assert.equal(agg.models['zai-glm-5-3'].pingCacheReadTokens.needless, 1152, "the needless ping's own cache-read cost lands in its per-outcome bucket")
     tool.gate.resolve()
     await tool.promise
     h.warmer.dispose()
@@ -901,9 +926,9 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     h.clock.advance(220_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
@@ -927,11 +952,11 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     tool.gate.resolve()
     await tool.promise
-    h.clock.advance(360_000)
+    h.clock.advance(358_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const agg = h.stats.snapshot().allTime
     assert.equal(agg.warms, 1)
@@ -951,7 +976,7 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'idle' })
     const agg = h.stats.snapshot().allTime
@@ -974,7 +999,7 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     h.warmer.onSessionDisposed({ id: 's1' })
     const agg = h.stats.snapshot().allTime
@@ -1006,7 +1031,7 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     h.clock.advance(160_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
@@ -1031,12 +1056,20 @@ const gateTool = (warmer, sid = 's1') => {
     const llm = {
       stream: async function* (options) {
         dispatches.push(options)
-        if (call++ === 0) {
+        if (call === 0) {
+          // The failed ping surfaced usage before dying: its observed cost must
+          // still be priced, flat AND per model (schema 3).
+          yield { type: 'usage', usage: { inputTokens: 700, cacheReadTokens: 999, outputTokens: 1 } }
           yield { type: 'finish', reason: { kind: 'error', failure: { code: 'rate', message: 'boom' } } }
-          return
+        } else if (call === 1) {
+          // Usage-less failure (died before surfacing any usage chunk): still a
+          // failed dispatch, but priced zero — flat AND per model stay put.
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'timeout', message: 'no usage surfaced' } } }
+        } else {
+          yield { type: 'usage', usage: { inputTokens: 1200, cacheReadTokens: 1152, outputTokens: 1 } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
         }
-        yield { type: 'usage', usage: { inputTokens: 1200, cacheReadTokens: 1152, outputTokens: 1 } }
-        yield { type: 'finish', reason: { kind: 'stop' } }
+        call++
       },
     }
     return { llm, dispatches }
@@ -1046,17 +1079,27 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000) // ping 1: fails WITH observed usage
     await settle()
-    h.clock.advance(240_000)
+    h.clock.advance(240_000) // the 0-delay re-arm fires overdue: retry at 482 fails with NO usage
     await settle()
-    h.clock.advance(220_000)
+    h.clock.advance(30_000) // failed retry re-arms half a margin out: ping 3 at 512 succeeds
+    await settle()
+    h.clock.advance(190_000) // 702 follow-up; the success re-armed at 754 — no fourth dispatch
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const agg = h.stats.snapshot().allTime
-    assert.equal(agg.warms, 2)
-    assert.equal(h.stats.snapshot().failed, 1, 'failed pings land in their own aggregate')
+    assert.equal(agg.warms, 3)
+    const snap = h.stats.snapshot()
+    assert.equal(snap.failed, 2, 'failed pings land in their own aggregate, surfaced usage or not')
+    assert.deepEqual(snap.failedPingTokens, { cacheRead: 999, uncached: 700 }, 'flat failed tokens price the observed usage; the usage-less failure adds zero')
+    assert.deepEqual(snap.allTime.models['zai-glm-5-3'].failedPingTokens, { cacheRead: 999, uncached: 700 }, 'schema 3: failed tokens attribute per model at closeChain; the usage-less failure adds zero here too')
+    assert.equal(
+      Object.values(snap.allTime.models).reduce((n, m) => n + m.failedPingTokens.cacheRead + m.failedPingTokens.uncached, 0),
+      snap.failedPingTokens.cacheRead + snap.failedPingTokens.uncached,
+      'flat failed tokens equal the per-model sums (post-upgrade attribution)',
+    )
     assert.equal(agg.expired, 0)
-    assert.equal(agg.savedCacheTokens, 1152, 'the second ping partitions against t0 (failed ping is no anchor) and hits')
+    assert.equal(agg.savedCacheTokens, 1152, 'the successful ping partitions against t0 (failed pings are no anchors) and hits')
     tool.gate.resolve()
     await tool.promise
     h.warmer.dispose()
@@ -1104,7 +1147,7 @@ const gateTool = (warmer, sid = 's1') => {
     warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(warmer)
-    clock.advance(240_000)
+    clock.advance(242_000)
     await settle()
     assert.equal(journal.entries.length, 1)
     assert.equal(journal.entries[0].counted, true, 'pings still journal without a stats sink')
@@ -1123,12 +1166,12 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool1 = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     tool1.gate.resolve()
     await tool1.promise
     const tool2 = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     tool2.gate.resolve()
     await tool2.promise
@@ -1166,11 +1209,11 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     // Follow-up lands while the ping is still in flight: the chain closes
     // with the ping unsettled (partitioned against 0..300s — needless).
-    h.clock.advance(60_000)
+    h.clock.advance(58_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const aggClosed = h.stats.snapshot().allTime
     assert.equal(aggClosed.needless, 1, 'the in-flight ping partitions without its hit value')
@@ -1199,7 +1242,7 @@ const gateTool = (warmer, sid = 's1') => {
     const before = createStatsEngine({ storageDir: tmp, config: baseConfig, now: clocked, warn: () => {} })
     before.onRealRequest('s1', 'mistral')
     nowMs = Date.UTC(2026, 9, 17, 23, 50, 0)
-    before.onPingDispatch('s1')
+    before.onPingDispatch('s1', 'zai-glm-5-3')
     before.onPingSettle('s1', { ok: true, cacheReadTokens: 1152 })
     before.dispose() // persists warms=1 for 2026-10-17; the open chain drops
     // Boot after midnight: the stale today bucket must reset on read.
@@ -1213,14 +1256,24 @@ const gateTool = (warmer, sid = 's1') => {
     // New attribution after midnight lands on the new day.
     after.onRealRequest('s1', 'mistral')
     nowMs = Date.UTC(2026, 9, 18, 0, 31, 0)
-    after.onPingDispatch('s1')
+    after.onPingDispatch('s1', 'zai-glm-5-3')
     after.onPingSettle('s1', { ok: true, cacheReadTokens: 1152 })
     nowMs = Date.UTC(2026, 9, 18, 0, 36, 0)
     after.onRealRequest('s1', 'mistral')
     snap = after.snapshot()
     assert.equal(snap.today.warms, 1, 'write-side rollover counts the new day only')
     assert.equal(snap.today.savedCacheTokens, 1152)
-    assert.deepEqual(snap.byDay['2026-10-18'], { warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152 })
+    assert.deepEqual(snap.byDay['2026-10-18'], {
+      warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+      models: {
+        'zai-glm-5-3': {
+          warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+          pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+          pingUncachedTokens: 0,
+          failedPingTokens: { cacheRead: 0, uncached: 0 },
+        },
+      },
+    })
     assert.equal(snap.allTime.warms, 2, 'allTime accumulates across days')
     assert.equal(snap.allTime.savedCacheTokens, 1152)
     after.dispose()
@@ -1261,10 +1314,11 @@ const gateTool = (warmer, sid = 's1') => {
     second.dispose()
 
     const stored = JSON.parse(readFileSync(join(tmp, 'stats.json'), 'utf8'))
-    for (const key of ['today', 'allTime', 'byDay', 'failed']) {
+    for (const key of ['today', 'allTime', 'byDay', 'failed', 'sessions']) {
       assert.ok(stored[key] !== undefined, `stats.json carries ${key}`)
     }
     assert.equal(stored.today.day, '2026-10-19')
+    assert.equal(stored.sessions.s1.warms, 2, 'session buckets round-trip and accumulate across engines')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -1274,7 +1328,7 @@ const gateTool = (warmer, sid = 's1') => {
 {
   const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-seed-'))
   try {
-    const pingLine = (ts, ok) => JSON.stringify({ ts, sessionId: 's1', provider: 'mistral', model: 'm', ttMs: 1000, ok, error: ok ? null : 'x', inputTokens: 1, cacheReadTokens: ok ? 1152 : 0, outputTokens: 1, dryRun: false, counted: true })
+    const pingLine = (ts, ok) => JSON.stringify({ ts, sessionId: 's1', provider: 'mistral', model: 'm', ttMs: 1000, ok, error: ok ? null : 'x', inputTokens: 1, uncachedInputTokens: 700, cacheReadTokens: ok ? 1152 : 0, outputTokens: 1, dryRun: false, counted: true })
     writeFileSync(join(tmp, 'warm.jsonl'), [
       pingLine('2026-10-19T10:00:00.000Z', true),
       pingLine('2026-10-19T10:04:00.000Z', true),
@@ -1290,6 +1344,16 @@ const gateTool = (warmer, sid = 's1') => {
     assert.equal(snap.allTime.warms, 3, 'corrupt stats.json reseeds warms from the journal')
     assert.equal(snap.failed, 1, 'failed dispatches reseed too')
     assert.equal(snap.allTime.needless + snap.allTime.noFollowup + snap.allTime.expired + snap.allTime.savedCacheTokens, 0, 'outcome buckets are not reconstructible and stay zero')
+    assert.equal(snap.allTime.models.m.warms, 3, 'seeded warms attribute per model')
+    assert.equal(snap.allTime.models.m.pingUncachedTokens, 1400, 'ok lines seed the raw-token basis per model')
+    assert.deepEqual(snap.failedPingTokens, { cacheRead: 0, uncached: 700 }, 'failed lines price only their observed usage')
+    assert.deepEqual(snap.allTime.models.m.failedPingTokens, { cacheRead: 0, uncached: 700 }, 'failed tokens reseed per line, per model (journal carries the model)')
+    assert.equal(
+      Object.values(snap.allTime.models).reduce((n, m) => n + m.failedPingTokens.cacheRead + m.failedPingTokens.uncached, 0),
+      snap.failedPingTokens.cacheRead + snap.failedPingTokens.uncached,
+      'flat failed tokens equal the per-model reseed sums',
+    )
+    assert.equal(snap.sessions.s1.warms, 3, 'per-session warms reconstruct from the journal\'s sessionId')
     // Attribution continues on top of the seed.
     engine.onRealRequest('s1', 'mistral')
     nowMs = Date.UTC(2026, 9, 19, 20, 10, 0)
@@ -1300,14 +1364,26 @@ const gateTool = (warmer, sid = 's1') => {
     snap = engine.snapshot()
     assert.equal(snap.allTime.warms, 4)
     assert.equal(snap.allTime.savedCacheTokens, 1152)
+    assert.equal(Object.values(snap.allTime.models).reduce((n, m) => n + m.warms, 0), snap.allTime.warms, 'flat warms equal the per-model sums even across a seed')
+    assert.equal(snap.sessions.s1.warms, 4, 'seeded session counts accumulate with post-seed attribution on the same sid')
     engine.dispose()
 
     // Absent stats.json + journal present: same seed path.
     const tmp2 = mkdtempSync(join(tmpdir(), 'dsh-warm-seed2-'))
     try {
-      writeFileSync(join(tmp2, 'warm.jsonl'), pingLine('2026-10-19T11:00:00.000Z', true) + '\n')
+      writeFileSync(join(tmp2, 'warm.jsonl'), pingLine('2026-10-19T11:00:00.000Z', true) + '\n'
+        + JSON.stringify({ ts: '2026-10-19T11:05:00.000Z', sessionId: 's2', provider: 'mistral', model: 'old', ok: true, cacheReadTokens: 1152, counted: true }) + '\n'
+        + JSON.stringify({ ts: '2026-10-19T11:10:00.000Z', sessionId: 's2', provider: 'mistral', model: 'old2', ok: false, error: 'x', cacheReadTokens: 500, uncachedInputTokens: 100, counted: true }) + '\n')
       const engine2 = createStatsEngine({ storageDir: tmp2, config: baseConfig, now: () => nowMs, warn: () => {} })
-      assert.equal(engine2.snapshot().allTime.warms, 1, 'absent stats.json seeds from the journal')
+      const snap2 = engine2.snapshot()
+      assert.equal(snap2.allTime.warms, 3, 'absent stats.json seeds from the journal')
+      assert.equal(snap2.failed, 1)
+      assert.equal(snap2.allTime.models.m.pingUncachedTokens, 700, 'the raw-token basis seeds per model')
+      assert.equal(snap2.allTime.models.old.pingUncachedTokens, 0, 'journal lines predating the token fields seed as 0')
+      assert.deepEqual(snap2.failedPingTokens, { cacheRead: 500, uncached: 100 })
+      assert.deepEqual(snap2.allTime.models.old2.failedPingTokens, { cacheRead: 500, uncached: 100 }, 'failed tokens reseed per line onto the line\'s own model')
+      assert.deepEqual(snap2.allTime.models.m.failedPingTokens, { cacheRead: 0, uncached: 0 }, 'ok lines never touch failed token maps')
+      assert.equal(snap2.sessions.s2.warms, 2, 'the old-format lines carry their own sessionId')
       assert.ok(existsSync(join(tmp2, 'stats.json')), 'the seed is written immediately')
       engine2.dispose()
     } finally {
@@ -1381,17 +1457,48 @@ const gateTool = (warmer, sid = 's1') => {
     const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => nowMs, warn: () => {} })
     engine.onRealRequest('s1', 'mistral')
     nowMs += 240_000
-    engine.onPingDispatch('s1')
-    engine.onPingSettle('s1', { ok: true, cacheReadTokens: 1152 })
-    nowMs += 160_000 // follow-up at +400s total: necessary (400-0 ≥ 302) + held (400-240 < 302)
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    engine.onPingSettle('s1', { ok: true, cacheReadTokens: 1152, uncachedTokens: 1200 })
+    nowMs += 60_000 // a second ping in the same chain fails, but surfaced usage first
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    engine.onPingSettle('s1', { ok: false, cacheReadTokens: 999, uncachedTokens: 700 })
+    nowMs += 100_000 // follow-up at +400s total: necessary (400-0 ≥ 302) + held (400-240 < 302)
     engine.onRealRequest('s1', 'mistral') // necessary + held + hit → saved
 
     const payload = makeStatsPayload(engine, baseConfig)
-    assert.equal(payload.schema, 1, 'wire payload carries a schema version')
+    assert.equal(payload.schema, 3, 'wire payload carries the schema-3 version')
     assert.equal(payload.statsEnabled, true)
-    assert.equal(payload.stats.allTime.warms, 1, 'payload embeds the snapshot')
+    assert.equal(payload.stats.allTime.warms, 2, 'payload embeds the snapshot')
     assert.equal(payload.stats.today.savedCacheTokens, 1152)
-    assert.equal(payload.stats.failed, 0)
+    assert.equal(payload.stats.failed, 1)
+    assert.deepEqual(payload.stats.failedPingTokens, { cacheRead: 999, uncached: 700 }, 'flat failed token basis rides the payload')
+    assert.deepEqual(payload.stats.allTime.models['zai-glm-5-3'].failedPingTokens, { cacheRead: 999, uncached: 700 }, 'schema 3: failed tokens per model on the wire')
+    assert.equal(
+      Object.values(payload.stats.allTime.models).reduce((n, m) => n + m.failedPingTokens.cacheRead + m.failedPingTokens.uncached, 0),
+      payload.stats.failedPingTokens.cacheRead + payload.stats.failedPingTokens.uncached,
+      'flat failed tokens equal the per-model sums (post-upgrade attribution)',
+    )
+    assert.deepEqual(payload.stats.today.models['zai-glm-5-3'], {
+      warms: 2, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+      pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+      pingUncachedTokens: 1200,
+      failedPingTokens: { cacheRead: 0, uncached: 0 },
+    }, 'per-model split: held spend, raw spend, saved credit (failed tokens stay all-time)')
+    assert.deepEqual(payload.stats.sessions.s1, {
+      warms: 2, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+      models: {
+        'zai-glm-5-3': {
+          warms: 2, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+          pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+          pingUncachedTokens: 1200,
+          failedPingTokens: { cacheRead: 0, uncached: 0 },
+        },
+      },
+    }, 'the session bucket mirrors the attribution; deepEqual proves the internal recency ts never reaches the wire')
+    for (const field of ['warms', 'needless', 'noFollowup', 'expired', 'savedCacheTokens']) {
+      const sum = Object.values(payload.stats.allTime.models).reduce((n, m) => n + m[field], 0)
+      assert.equal(sum, payload.stats.allTime[field], `flat ${field} equals the per-model sum`)
+    }
     assert.equal(payload.config.providers.mistral.intervalMs, 240_000, 'provider summary carries intervalMs')
     assert.equal(payload.config.providers.mistral.ttlMs, 302_000, 'provider summary carries ttlMs')
     assert.deepEqual(payload.config.budget, { dailyPingBudget: baseConfig.dailyPingBudget, maxPingsPerBlock: baseConfig.maxPings }, 'budget summary')
@@ -1421,9 +1528,12 @@ const gateTool = (warmer, sid = 's1') => {
     assert.ok(res instanceof Response, 'route returns a Response')
     assert.equal(res.headers.get('content-type'), 'application/json')
     const body = JSON.parse(await res.text())
-    assert.equal(body.schema, 1)
+    assert.equal(body.schema, 3)
     assert.equal(body.statsEnabled, true)
     assert.equal(body.stats.allTime.warms, 0, 'empty engine still snapshots')
+    assert.deepEqual(body.stats.allTime.models, {}, 'empty engines expose the empty models map')
+    assert.deepEqual(body.stats.sessions, {}, 'empty engines expose the empty sessions map')
+    assert.deepEqual(body.stats.failedPingTokens, { cacheRead: 0, uncached: 0 })
     engine.dispose()
   } finally {
     rmSync(tmp, { recursive: true, force: true })
@@ -1438,6 +1548,7 @@ const gateTool = (warmer, sid = 's1') => {
   const source = readFileSync(join(repoRoot, 'client', 'index.js'), 'utf8')
   assert.ok(source.includes("const STATS_URL = 'api/dsh-warm/stats'"), 'client fetches a RELATIVE stats url (reverse-proxy safe)')
   assert.ok(!source.includes("fetch('/api"), 'no root-absolute fetch anywhere in the client')
+  assert.ok(source.includes('wasted: follow-up too late'), 'the expired row leads with the follow-up, not the cache')
 
   // Load through a stubbed ModuleLoader with a stubbed react baseline.
   const loaded = []
@@ -1515,16 +1626,16 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     const tool = gateTool(h.warmer)
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle() // ping1 (chain A) dispatched, stream held at gate[0]
     assert.equal(h.stats.snapshot().allTime.warms, 1)
     // Follow-up request: bumps the epoch, closes chain A (ping1 partitions as
-    // needless — 300s < 302s), opens chain B, re-arms the grid.
-    h.clock.advance(60_000)
+    // needless — 300s < 302s), opens chain B, re-arms the anchored schedule.
+    h.clock.advance(58_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
     assert.equal(h.stats.snapshot().allTime.needless, 1, 'chain A closed with ping1 in flight')
     // Chain B dispatches its own ping (gate[1] holds it).
-    h.clock.advance(240_000)
+    h.clock.advance(242_000)
     await settle()
     assert.equal(h.stats.snapshot().allTime.warms, 2, 'chain B dispatched its own ping')
     // The superseded ping1 settles FIRST, while ping2 is in flight: its
@@ -1534,7 +1645,7 @@ const gateTool = (warmer, sid = 's1') => {
     // ping2 settles with its own outcome — not overwritten, not dropped.
     h.llmExtras.gates[1].resolve()
     await settle()
-    // Follow-up closes chain B: ping2 was necessary (400s ≥ TTL) and held
+    // Follow-up closes chain B: ping2 was necessary (402s ≥ TTL) and held
     // (160s < TTL); only ping2's own hit value may be credited.
     h.clock.advance(160_000)
     h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
@@ -1543,8 +1654,894 @@ const gateTool = (warmer, sid = 's1') => {
     assert.equal(agg.needless, 1, 'only chain A\'s in-flight ping was needless')
     assert.equal(agg.expired, 0)
     assert.equal(agg.savedCacheTokens, 1152, 'saved credits ping2\'s own hit, never the superseded ping1\'s 9999')
+    const modelAgg = agg.models['zai-glm-5-3']
+    assert.equal(modelAgg.pingCacheReadTokens.held, 1152, 'held spend is ping2\'s own hit; the superseded 9999 never lands')
+    assert.equal(modelAgg.pingCacheReadTokens.needless, 0, 'chain A\'s in-flight ping had no observed usage at close')
+    assert.equal(modelAgg.pingUncachedTokens, 1200, 'raw spend counts ping2 only; ping1\'s dropped settle never prices')
+    const session = h.stats.snapshot().sessions.s1
+    assert.equal(session.warms, 2, 'the session bucket carries only this session\'s chains')
+    assert.equal(session.needless, 1)
+    assert.equal(session.savedCacheTokens, 1152)
+    assert.equal(session.models['zai-glm-5-3'].pingCacheReadTokens.held, 1152)
     assert.equal(h.journal.entries.length, 2, 'both dispatches still journal (budget honesty)')
     assert.ok(h.journal.entries.every((e) => e.counted === true))
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 48. Debug trace: full event sequence through the real wiring -----------
+// The debug sink (config debug:true) is the live-host diagnosis channel: it
+// must observe every warmer event and every stats partition with enough
+// context to reconstruct why an outcome bucket did or did not move.
+{
+  const events = []
+  const h = statsHarness({}, undefined, (event) => events.push(event))
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const tool = gateTool(h.warmer)
+    h.clock.advance(242_000)
+    await settle()
+    h.clock.advance(58_000)
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const ev = (name) => events.filter((e) => e.ev === name)
+    assert.ok(ev('llm/stream').length === 2 && ev('llm/stream').every((e) => e.accepted === true && e.sid === 's1'),
+      'every conversation request is traced as accepted')
+    assert.deepEqual(ev('tools/execute').map((e) => [e.sid, e.outstanding]), [['s1', 1]],
+      'tool window opens with outstanding count')
+    assert.ok(ev('ping.dispatch').length === 1 && ev('ping.settle').length === 1,
+      'ping dispatch and settle are traced')
+    const closes = ev('chain.close')
+    assert.equal(closes.length, 2, 'one not-found close (first request) + one attributed close (follow-up)')
+    const attributed = closes.find((c) => c.pings !== null)
+    assert.equal(attributed.sid, 's1')
+    assert.equal(attributed.followup, true)
+    assert.equal(attributed.pings, 1)
+    assert.equal(attributed.outcome.needless, 1, 'close trace carries the attribution')
+    assert.equal(attributed.outcome.pingCacheReadTokens.needless, 1152, 'close trace carries per-outcome token sums')
+    assert.equal(attributed.outcome.pingUncachedTokens, 1200)
+    assert.equal(attributed.gap, 300_000, 'close trace carries the t0-to-follow-up gap the partition judges')
+    assert.equal(ev('ping.settle')[0].model, 'zai-glm-5-3', 'settle trace carries the ping model')
+    assert.deepEqual(ev('chain.ping')[0].sid, 's1', 'ping membership trace')
+    assert.ok(events.every((e) => e.sid === undefined || e.sid === 's1'), 'sids consistent across the trace')
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.needless, 1, 'the traced flow still attributes')
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 49. Token ledger end-to-end: per-outcome per-model buckets + payload ----
+{
+  // Miss first (the provider recomputed the prefix: 5000 uncached tokens),
+  // then hits (1200 uncached + 1152 cache-read each).
+  const missFirstLlm = () => {
+    const dispatches = []
+    let call = 0
+    const llm = {
+      stream: async function* (options) {
+        dispatches.push(options)
+        const miss = call++ === 0
+        yield { type: 'usage', usage: { inputTokens: miss ? 5000 : 1200, cacheReadTokens: miss ? 0 : 1152, outputTokens: 1 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }
+    return { llm, dispatches }
+  }
+  const h = statsHarness({}, missFirstLlm)
+  try {
+    const { makeStatsPayload } = await import('../lib/index.js')
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // chain 1: t0=0
+    const tool = gateTool(h.warmer)
+    h.clock.advance(242_000)
+    await settle() // ping1: miss — raw spend, no anchor value
+    h.clock.advance(242_000)
+    await settle() // ping2: hit
+    h.clock.advance(220_000) // 704 s
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // follow-up closes chain 1 (held), opens chain 2
+    h.clock.advance(242_000)
+    await settle() // ping3: chain 2's own ping
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'idle' }) // chain 2 closes no-followup
+
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.warms, 3)
+    assert.equal(agg.needless, 0)
+    assert.equal(agg.noFollowup, 1)
+    assert.equal(agg.savedCacheTokens, 1152, 'the follow-up credits the held chain\'s last hit')
+    const model = agg.models['zai-glm-5-3']
+    assert.deepEqual(model.pingCacheReadTokens, { held: 1152, needless: 0, noFollowup: 1152, expired: 0 },
+      'each ping\'s cache-read cost lands in its own outcome bucket')
+    assert.equal(model.pingUncachedTokens, 7400, 'the miss\'s 5000 uncached tokens are the raw-price basis; hit tails add 1200 each')
+    assert.equal(model.warms, 3)
+
+    const payload = makeStatsPayload(h.stats, baseConfig)
+    assert.equal(payload.schema, 3)
+    const wire = payload.stats
+    for (const field of ['warms', 'needless', 'noFollowup', 'expired', 'savedCacheTokens']) {
+      const sum = Object.values(wire.allTime.models).reduce((n, m) => n + m[field], 0)
+      assert.equal(sum, wire.allTime[field], `flat ${field} equals the per-model sum`)
+    }
+    assert.equal(wire.today.noFollowup, 1)
+    assert.deepEqual(wire.failedPingTokens, { cacheRead: 0, uncached: 0 })
+    assert.deepEqual(wire.sessions.s1, {
+      warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152,
+      models: {
+        'zai-glm-5-3': {
+          warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152,
+          pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 1152, expired: 0 },
+          pingUncachedTokens: 7400,
+          failedPingTokens: { cacheRead: 0, uncached: 0 },
+        },
+      },
+    }, 'the session bucket mirrors the session\'s whole warming story, wire-pure')
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 50. Legacy stats.json adopt (schema 1 + 2): absent maps zero-seeded ---
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-legacy-'))
+  try {
+    // Exactly what a schema-1 build wrote: count buckets + failed, no models, no failedPingTokens
+    // (today is the persist-time mirror of its own byDay entry).
+    const legacy = {
+      today: { day: '2026-10-19', warms: 2, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152 },
+      allTime: { warms: 5, needless: 1, noFollowup: 2, expired: 1, savedCacheTokens: 4608 },
+      byDay: { '2026-10-19': { warms: 2, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152 } },
+      failed: 1,
+    }
+    writeFileSync(join(tmp, 'stats.json'), JSON.stringify(legacy))
+    let nowMs = Date.UTC(2026, 9, 20, 6, 0, 0)
+    const warns = []
+    const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => nowMs, warn: (msg) => { warns.push(msg) } })
+    let snap = engine.snapshot()
+    assert.deepEqual(warns, [], 'a legacy file is a valid shape: adopt, never warn or reseed')
+    assert.equal(snap.allTime.warms, 5, 'legacy counters adopt untouched')
+    assert.equal(snap.allTime.savedCacheTokens, 4608)
+    assert.equal(snap.failed, 1)
+    assert.equal(snap.byDay['2026-10-19'].warms, 2, 'stored history rides along')
+    assert.equal(snap.today.day, '2026-10-20', 'today starts fresh on the current UTC day')
+    assert.equal(snap.today.warms, 0)
+    assert.deepEqual(snap.allTime.models, {}, 'absent models maps zero-seed, never stay undefined')
+    assert.deepEqual(snap.failedPingTokens, { cacheRead: 0, uncached: 0 })
+
+    // Attribution continues on top of the adopted file.
+    engine.onRealRequest('s1', 'mistral')
+    nowMs = Date.UTC(2026, 9, 20, 6, 4, 0)
+    engine.onPingDispatch('s1', 'm')
+    engine.onPingSettle('s1', { ok: true, cacheReadTokens: 1152, uncachedTokens: 1200, model: 'm' })
+    nowMs = Date.UTC(2026, 9, 20, 6, 7, 0)
+    engine.onRealRequest('s1', 'mistral') // follow-up: necessary, held → saved 1152
+    snap = engine.snapshot()
+    assert.equal(snap.allTime.warms, 6)
+    assert.equal(snap.allTime.savedCacheTokens, 5760)
+    assert.deepEqual(snap.allTime.models.m, {
+      warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+      pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+      pingUncachedTokens: 1200,
+      failedPingTokens: { cacheRead: 0, uncached: 0 },
+    }, 'post-upgrade attribution is per-model')
+    assert.equal(snap.today.models.m.warms, 1, 'the fresh day attributes per model too')
+    const modelSum = Object.values(snap.allTime.models).reduce((n, m) => n + m.warms, 0)
+    assert.equal(snap.allTime.warms - modelSum, 5,
+      'the flat-vs-models gap is exactly the pre-upgrade legacy counts (documented divergence, never an overcount)')
+    assert.deepEqual(snap.sessions.s1, {
+      warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+      models: {
+        m: {
+          warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+          pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+          pingUncachedTokens: 1200,
+          failedPingTokens: { cacheRead: 0, uncached: 0 },
+        },
+      },
+    }, 'per-session attribution counts only post-upgrade work; the legacy flat counts have no session home')
+    engine.dispose()
+
+    // Schema-2 adopt — the per-model failed-token maps' own pre-upgrade file:
+    // flat failedPingTokens already existed, per-model maps did not. One
+    // post-upgrade failed ping then adds to both sides in lockstep while flat
+    // stays the complete total, so the flat-vs-sums gap is exactly the
+    // pre-upgrade rows — never an overcount (verifier's live proof: 111 + 222).
+    const schema2 = {
+      today: { day: '2026-10-19', warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0, models: {} },
+      allTime: {
+        warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0,
+        models: {
+          'legacy-model': {
+            warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0,
+            pingCacheReadTokens: { held: 0, needless: 0, noFollowup: 0, expired: 0 },
+            pingUncachedTokens: 800,
+          },
+        },
+      },
+      byDay: {
+        '2026-10-19': {
+          warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0,
+          models: {
+            'legacy-model': {
+              warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0,
+              pingCacheReadTokens: { held: 0, needless: 0, noFollowup: 0, expired: 0 },
+              pingUncachedTokens: 800,
+            },
+          },
+        },
+      },
+      failed: 1,
+      failedPingTokens: { cacheRead: 111, uncached: 222 },
+    }
+    writeFileSync(join(tmp, 'stats.json'), JSON.stringify(schema2))
+    const engine2 = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => nowMs, warn: (msg) => { warns.push(msg) } })
+    assert.deepEqual(warns, [], 'a schema-2 file is a valid shape too: adopt, never warn or reseed')
+    let snap2 = engine2.snapshot()
+    assert.deepEqual(snap2.failedPingTokens, { cacheRead: 111, uncached: 222 }, 'schema-2 flat failed tokens adopt as-is')
+    assert.deepEqual(snap2.allTime.models['legacy-model'].failedPingTokens, { cacheRead: 0, uncached: 0 }, 'absent per-model failed-token maps zero-seed, never stay undefined')
+    nowMs = Date.UTC(2026, 9, 20, 7, 0, 0)
+    engine2.onRealRequest('s2', 'mistral')
+    nowMs = Date.UTC(2026, 9, 20, 7, 4, 0)
+    engine2.onPingDispatch('s2', 'm')
+    engine2.onPingSettle('s2', { ok: false, cacheReadTokens: 999, uncachedTokens: 700, model: 'm' })
+    nowMs = Date.UTC(2026, 9, 20, 7, 7, 0)
+    engine2.onRealRequest('s2', 'mistral') // follow-up closes the chain: the failed ping prices at close
+    snap2 = engine2.snapshot()
+    assert.equal(snap2.failed, 2, 'the failed count continues on top of the adopted total')
+    assert.equal(snap2.allTime.warms, 2, 'dispatch counts the new ping on top of the adopted warms')
+    assert.deepEqual(snap2.failedPingTokens, { cacheRead: 1110, uncached: 922 }, 'flat keeps the legacy rows and adds the increment')
+    assert.deepEqual(snap2.allTime.models.m.failedPingTokens, { cacheRead: 999, uncached: 700 }, 'the new failed ping attributes per model')
+    const flatTotal = snap2.failedPingTokens.cacheRead + snap2.failedPingTokens.uncached
+    const perModelTotal = Object.values(snap2.allTime.models).reduce((n, m) => n + m.failedPingTokens.cacheRead + m.failedPingTokens.uncached, 0)
+    assert.equal(flatTotal - perModelTotal, 333, 'the flat-vs-per-model gap is exactly the pre-upgrade rows (111 + 222)')
+    engine2.dispose()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 51. Per-session ledger: parallel sessions + bounded map ------------------
+{
+  // Part A: two sessions through one warmer — buckets never cross.
+  {
+    const h = statsHarness()
+    try {
+      h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+      h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // s1 chain 1: t0=0
+      const tool1 = gateTool(h.warmer)
+      h.clock.advance(242_000)
+      await settle() // s1 ping1: hit
+      tool1.gate.resolve()
+      await tool1.promise
+      h.clock.advance(160_000) // t=402
+      h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // s1 follow-up: chain 1 closes saved, chain 2 opens (no tool pending: no timer)
+      h.warmer.onAgentStatus({ agent: { id: 's2' }, status: 'running' })
+      const req2 = { ...conversationRequest, sessionId: 's2' }
+      h.warmer.onLlmStream(req2, () => [])[Symbol.iterator]() // s2 chain: t0=402
+      const tool2 = gateTool(h.warmer, 's2')
+      h.clock.advance(242_000)
+      await settle() // s2 ping: hit
+      h.warmer.onAgentStatus({ agent: { id: 's2' }, status: 'idle' }) // s2 closes no-followup
+
+      const snap = h.stats.snapshot()
+      assert.equal(snap.allTime.warms, 2, 'global totals mirror both sessions')
+      assert.equal(snap.allTime.savedCacheTokens, 1152)
+      assert.equal(snap.allTime.noFollowup, 1)
+      assert.deepEqual(snap.sessions.s1, {
+        warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+        models: {
+          'zai-glm-5-3': {
+            warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 1152,
+            pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 0, expired: 0 },
+            pingUncachedTokens: 1200,
+            failedPingTokens: { cacheRead: 0, uncached: 0 },
+          },
+        },
+      }, 's1: only its own chain, saved on the held follow-up')
+      assert.deepEqual(snap.sessions.s2, {
+        warms: 1, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 0,
+        models: {
+          'zai-glm-5-3': {
+            warms: 1, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 0,
+            pingCacheReadTokens: { held: 0, needless: 0, noFollowup: 1152, expired: 0 },
+            pingUncachedTokens: 1200,
+            failedPingTokens: { cacheRead: 0, uncached: 0 },
+          },
+        },
+      }, 's2: idle close, nothing credited, no leak from s1')
+      tool2.gate.resolve()
+      await tool2.promise
+      h.warmer.dispose()
+    } finally {
+      cleanupStats(h)
+    }
+  }
+
+  // Part B: the ledger is bounded — 60 fake sessions, only the 50
+  // most-recently-active buckets survive; global numbers keep everything.
+  {
+    const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-prune-'))
+    try {
+      let nowMs = Date.UTC(2026, 9, 20, 8, 0, 0)
+      const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => nowMs, warn: () => {} })
+      for (let i = 0; i < 60; i++) {
+        const sid = `s${i}`
+        engine.onRealRequest(sid, 'mistral')
+        nowMs += 1000
+        engine.onPingDispatch(sid)
+        nowMs += 1000
+        engine.onRealRequest(sid, 'mistral') // follow-up closes the chain (needless; irrelevant here)
+      }
+      const snap = engine.snapshot()
+      assert.equal(Object.keys(snap.sessions).length, 50, 'the session ledger is bounded at 50')
+      assert.ok(snap.sessions.s59 !== undefined, 'the most-recent session survives')
+      assert.ok(snap.sessions.s10 !== undefined, 'the 50th most-recent session survives')
+      assert.ok(snap.sessions.s9 === undefined, 'older session buckets prune at persist')
+      assert.equal(snap.allTime.warms, 60, 'pruned sessions keep their global numbers')
+      engine.dispose()
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+}
+
+// --- 52. Dense margin, long window: the live bug — every ping held --------------
+// Live case (debug.jsonl, mistral margin 60s, TTL 302s): a 368s block whose
+// per-ping marginal rule marked every ping needless (neighbors 120s apart),
+// so savedCacheTokens never credited. Chain-level necessity fixes the class.
+// marginMs 242000 pins the anchored spacing at 302-242 = 60s, so this stays
+// a pure stats-partition proof: the cadence matches the old interval grid.
+{
+  const denseConfig = { providers: { mistral: { ...baseConfig.providers.mistral, intervalMs: 60_000, marginMs: 242_000 } } }
+  const h = statsHarness(denseConfig)
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // chain: t0=0
+    const tool = gateTool(h.warmer)
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(60_000)
+      await settle() // pings at +60/+120/+180, each hit
+    }
+    tool.gate.resolve()
+    await tool.promise
+    h.clock.advance(188_000) // follow-up at +368: past t0+302, within 302 of the last ping
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.warms, 3)
+    assert.equal(agg.needless, 0, 'chain-level necessity: the margin bridged 368s, no ping is expendable')
+    assert.equal(agg.expired, 0)
+    assert.equal(agg.savedCacheTokens, 1152, 'the follow-up verifiably needed the pings: the last hit is credited')
+    assert.equal(agg.models['zai-glm-5-3'].pingCacheReadTokens.held, 3456, 'all three pings\' cache-read cost lands in held')
+    assert.equal(agg.models['zai-glm-5-3'].pingUncachedTokens, 3600)
+    const session = h.stats.snapshot().sessions.s1
+    assert.equal(session.warms, 3, 'the session bucket carries the whole dense-grid story')
+    assert.equal(session.savedCacheTokens, 1152)
+    assert.equal(session.models['zai-glm-5-3'].pingCacheReadTokens.held, 3456)
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 53. Dense margin, short window: follow-up beats t0 + ttl → all needless --
+{
+  const denseConfig = { providers: { mistral: { ...baseConfig.providers.mistral, intervalMs: 60_000, marginMs: 242_000 } } }
+  const h = statsHarness(denseConfig)
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // t0=0
+    const tool = gateTool(h.warmer)
+    h.clock.advance(60_000)
+    await settle()
+    h.clock.advance(60_000)
+    await settle() // pings at +60/+120
+    tool.gate.resolve()
+    await tool.promise
+    h.clock.advance(60_000) // follow-up at +180 < t0+302: the t0 cache alone survives
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.warms, 2)
+    assert.equal(agg.needless, 2, 'warm-anyway at chain level, even though each ping\'s neighbor is only 60s away')
+    assert.equal(agg.expired, 0)
+    assert.equal(agg.savedCacheTokens, 0, 'no ping bought anything: the real request kept the prefix warm')
+    assert.equal(agg.models['zai-glm-5-3'].pingCacheReadTokens.needless, 2304)
+    assert.equal(agg.models['zai-glm-5-3'].pingCacheReadTokens.held, 0)
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 54. Necessary chain whose cover lapsed: expired, not saved --------------
+{
+  const denseConfig = { providers: { mistral: { ...baseConfig.providers.mistral, intervalMs: 60_000, marginMs: 242_000 } } }
+  const h = statsHarness(denseConfig)
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]() // t0=0
+    const tool = gateTool(h.warmer)
+    h.clock.advance(60_000)
+    await settle()
+    h.clock.advance(60_000)
+    await settle() // pings at +60/+120, both hit
+    tool.gate.resolve()
+    await tool.promise
+    h.clock.advance(380_000) // follow-up at +500: necessary (500 >= 302) but 380s after the last ping
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.warms, 2)
+    assert.equal(agg.needless, 0)
+    assert.equal(agg.expired, 2, 'the follow-up needed warming, but even the last ping\'s TTL had lapsed')
+    assert.equal(agg.savedCacheTokens, 0)
+    assert.equal(agg.models['zai-glm-5-3'].pingCacheReadTokens.expired, 2304)
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 55. Anchored schedule: due at ttl - margin, not on the interval grid -----
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, '241s: one second before the anchored due nothing fires (the 240s grid slot is dead)')
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'ping fires at ttl - margin after the capture')
+  assert.equal(Date.parse(journal.entries[0].ts), 242_000, 'dispatch ts is the anchored due 302-60, not the grid\'s 240')
+  clock.advance(242_000)
+  await settle()
+  assert.equal(dispatches.length, 2)
+  assert.equal(Date.parse(journal.entries[1].ts), 484_000, 'the hit moved the base: 242 + 242, not the grid\'s 482')
+  clock.advance(215_000)
+  await settle()
+  assert.equal(dispatches.length, 2, '699s is still short of the third due at 726s')
+  gate.resolve()
+  await toolPromise
+  assert.equal(dispatches.length, 2, 'no ping after the tool settles')
+  assert.equal(clock.pendingCount(), 0, 'timer cleaned up')
+  warmer.dispose()
+}
+
+// --- 56. Anchored schedule ignores the interval grid when ttlMs is set -------
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer({ providers: { mistral: { intervalMs: 120_000, ttlMs: 302_000, marginMs: 60_000 } } })
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(121_000)
+  await settle()
+  assert.equal(dispatches.length, 0, '121s: the 120s grid slot passes unused (the old grid would have fired here)')
+  clock.advance(121_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'the only dispatch lands on the anchored due')
+  assert.equal(Date.parse(journal.entries[0].ts), 242_000)
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 57. Failed pings retry on the margin-half backoff, capped by maxPings ----
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer()
+  const failingLlm = {
+    stream: async function* () {
+      throw new Error('provider 503')
+    },
+  }
+  const warmer2 = createWarmer({
+    llm: failingLlm,
+    config: { ...baseConfig },
+    journal,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    signal: () => ({ timeoutMs: 90_000 }),
+    warn: () => {},
+  })
+  warmer2.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer2.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer2.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(242_000)
+  await settle()
+  assert.equal(journal.entries.length, 1, 'attempt 1 fails at the anchored due')
+  assert.equal(journal.entries[0].ok, false)
+  assert.equal(journal.entries[0].counted, true, 'every retry attempt is a real dispatch: budget honesty')
+  clock.advance(29_000)
+  await settle()
+  assert.equal(journal.entries.length, 2, 'the failure re-armed at the past due: the retry fires on the next tick')
+  for (let i = 0; i < 3; i++) {
+    clock.advance(30_000)
+    await settle()
+  }
+  assert.equal(journal.entries.length, 5, 'margin-half backoff cadence up to maxPings')
+  for (let i = 2; i < 5; i++) {
+    assert.equal(Date.parse(journal.entries[i].ts) - Date.parse(journal.entries[i - 1].ts), 30_000, 'retry backoff is floor(margin/2) = 30s, never a tight loop')
+  }
+  clock.advance(600_000)
+  await settle()
+  assert.equal(journal.entries.length, 5, 'maxPings caps the retry chain (the budget is untouched)')
+  gate.resolve()
+  await toolPromise
+  warmer2.dispose()
+}
+
+// --- 58. A successful retry moves the base; the failed attempt does not -----
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer()
+  let call = 0
+  const flakyLlm = {
+    stream: async function* () {
+      if (call++ === 0) {
+        throw new Error('provider 503')
+      }
+      yield { type: 'usage', usage: { inputTokens: 1200, cacheReadTokens: 1152, outputTokens: 1 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    },
+  }
+  const warmer2 = createWarmer({
+    llm: flakyLlm,
+    config: { ...baseConfig },
+    journal,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    signal: () => ({ timeoutMs: 90_000 }),
+    warn: () => {},
+  })
+  warmer2.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer2.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer2.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(242_000)
+  await settle()
+  assert.equal(journal.entries.length, 1)
+  assert.equal(journal.entries[0].ok, false, 'attempt 1 fails; it proves no warmth')
+  clock.advance(30_000)
+  await settle()
+  assert.equal(journal.entries.length, 2)
+  assert.equal(journal.entries[1].ok, true, 'the retry succeeds at 272s: its dispatch ts becomes the base')
+  clock.advance(241_000)
+  await settle()
+  assert.equal(journal.entries.length, 2, '513s: one second before 272 + 242 nothing fires')
+  clock.advance(1_000)
+  await settle()
+  assert.equal(journal.entries.length, 3)
+  assert.equal(Date.parse(journal.entries[2].ts), 514_000, 'the next ping anchors on the successful retry, not the failed one')
+  gate.resolve()
+  await toolPromise
+  warmer2.dispose()
+}
+
+// --- 59. No ttlMs: the legacy interval grid still schedules ------------------
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer({ providers: { mistral: { intervalMs: 240_000, marginMs: 60_000 } } })
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'without a measured TTL the interval grid still fires at 240s')
+  clock.advance(240_000)
+  await settle()
+  assert.equal(dispatches.length, 2)
+  assert.equal(Date.parse(journal.entries[1].ts), 480_000, 'the grid counts slots off the capture, hits or not')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 60. Config: marginMs validation and the ttl/margin pairing check -------
+{
+  const { loadConfig } = await import('../lib/config.js')
+  const { mkdirSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-margincfg-'))
+  const warnings = []
+  const warn = (m) => warnings.push(m)
+  try {
+    // Invalid marginMs: warn + fall back to the default.
+    mkdirSync(join(tmp, 'a'), { recursive: true })
+    writeFileSync(join(tmp, 'a', 'config.json'), JSON.stringify({ providers: { flaky: { intervalMs: 240_000, marginMs: 'soon' } } }))
+    const cfgA = loadConfig(join(tmp, 'a'), warn)
+    assert.deepEqual(cfgA.providers.flaky, { intervalMs: 240_000, marginMs: 60_000 }, 'non-numeric marginMs falls back to 60000')
+    assert.ok(warnings.some((m) => m.includes('marginMs invalid')), 'invalid marginMs warns')
+
+    warnings.length = 0
+    mkdirSync(join(tmp, 'b'), { recursive: true })
+    writeFileSync(join(tmp, 'b', 'config.json'), JSON.stringify({ providers: { flaky: { intervalMs: 240_000, marginMs: 0 } } }))
+    const cfgB = loadConfig(join(tmp, 'b'), warn)
+    assert.equal(cfgB.providers.flaky.marginMs, 60_000, 'zero marginMs falls back to 60000')
+    assert.ok(warnings.some((m) => m.includes('marginMs invalid')))
+
+    // A margin that eats the whole TTL: anchored scheduling impossible — drop ttlMs.
+    warnings.length = 0
+    mkdirSync(join(tmp, 'c'), { recursive: true })
+    writeFileSync(join(tmp, 'c', 'config.json'), JSON.stringify({ providers: { mistral: { intervalMs: 240_000, ttlMs: 302_000, marginMs: 350_000 } } }))
+    const cfgC = loadConfig(join(tmp, 'c'), warn)
+    assert.equal(cfgC.providers.mistral.ttlMs, undefined, 'marginMs >= ttlMs drops ttlMs: the interval grid takes over')
+    assert.equal(cfgC.providers.mistral.marginMs, 350_000, 'marginMs itself is kept (harmless in grid mode)')
+    assert.equal(cfgC.providers.mistral.intervalMs, 240_000)
+    assert.ok(warnings.some((m) => m.includes('marginMs=350000') && m.includes('dropping ttlMs')), 'the pairing failure warns loudly')
+
+    // Fresh default round-trip carries marginMs.
+    const cfgD = loadConfig(join(tmp, 'd'), warn)
+    assert.equal(cfgD.providers.mistral.marginMs, 60_000)
+    const raw = JSON.parse(readFileSync(join(tmp, 'd', 'config.json'), 'utf8'))
+    assert.equal(raw.providers.mistral.marginMs, 60_000, 'fresh config.json carries marginMs')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 61. Budget caps the anchored schedule too --------------------------------
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer({ dailyPingBudget: 2 })
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 0, '241s: nothing before the anchored due')
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'ping 1 at the anchored due')
+  clock.advance(242_000)
+  await settle()
+  assert.equal(dispatches.length, 2, 'ping 2 on the moved base')
+  clock.advance(600_000)
+  await settle()
+  assert.equal(dispatches.length, 2, 'the budget gate stops the re-arm; maxPings 5 is never reached')
+  assert.equal(journal.entries.length, 2)
+  assert.ok(journal.entries.every((e) => e.counted === true))
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 62. A superseded ping's success must not move the new epoch's base ------
+{
+  // Same gated-pair llm as scenario 47: the first stream reports a distinctively
+  // wrong 9999 cache-read so a stolen base would show up in the dispatch ts.
+  const gatedPairLlm = () => {
+    const dispatches = []
+    const gates = []
+    const llm = {
+      stream: async function* (options) {
+        const index = dispatches.push(options) - 1
+        const gate = { resolve: null }
+        const gatePromise = new Promise((r) => { gate.resolve = r })
+        gates.push(gate)
+        await gatePromise
+        const tokens = index === 0 ? 9999 : 1152
+        yield { type: 'usage', usage: { inputTokens: 1200, cacheReadTokens: tokens, outputTokens: 1 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }
+    return { llm, dispatches, gates }
+  }
+  const h = statsHarness({}, gatedPairLlm)
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const tool = gateTool(h.warmer)
+    h.clock.advance(242_000)
+    await settle() // ping1 (epoch 1) in flight at gate[0]
+    h.clock.advance(8_000) // t=250: a new request supersedes epoch 1 (base 250, due 492)
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    assert.equal(h.stats.snapshot().allTime.needless, 1, 'chain A closed with its ping in flight (250s < 302s)')
+    h.llmExtras.gates[0].resolve() // the superseded ping settles OK: must not move the base
+    await settle()
+    // Hardening: a superseded settle that (buggy) wrote refreshBase would leave
+    // the base at 242 while the capture at 250 set it to 250. The pending timer
+    // masks the leak until it fires, so end the tool (cancels the timer) and
+    // re-open it — the fresh arm must compute off the capture at 250 (due 492),
+    // not the superseded ping at 242 (due 484).
+    tool.gate.resolve()
+    await tool.promise
+    const tool2 = gateTool(h.warmer)
+    h.clock.advance(234_000) // t=484: the leaked base would already have dispatched
+    await settle()
+    assert.equal(h.dispatches.length, 1, 'no dispatch at 484s: the re-open armed from the capture at 250, not the superseded ping at 242')
+    h.clock.advance(8_000) // t=492: chain B's own ping
+    await settle()
+    h.llmExtras.gates[1].resolve()
+    await settle()
+    assert.equal(h.journal.entries.length, 2, 'both dispatches journal (budget honesty)')
+    assert.ok(h.journal.entries.every((e) => e.counted === true))
+    const agg = h.stats.snapshot().allTime
+    assert.equal(agg.warms, 2)
+    assert.equal(agg.savedCacheTokens, 0, 'chain B never closed: the superseded 9999-token hit is never credited')
+    // Chain B's ping settled at its dispatch ts 492: the re-armed due must be
+    // 492 + 242 = 734. The leaked base (242) would have dispatched at 484,
+    // settled, and re-armed at 726 — inside this window.
+    h.clock.advance(241_000) // t=733: one second before the re-armed due
+    await settle()
+    assert.equal(h.dispatches.length, 2, 'no dispatch at 733s: the base moved to the dispatch ts 492, not the leaked 242')
+    h.clock.advance(1_000) // t=734: the next anchored ping
+    await settle()
+    assert.equal(h.dispatches.length, 3)
+    tool2.gate.resolve()
+    await tool2.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 63. dryRun previews the anchored cadence, never the clamp loop ------------
+{
+  const { warmer, clock, dispatches, journal } = makeWarmer({ dryRun: true })
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const gatePromise = new Promise((r) => { gate.resolve = r })
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+  clock.advance(242_000)
+  await settle()
+  assert.equal(dispatches.length, 0, 'dry-run never dispatches')
+  assert.equal(journal.entries.length, 1)
+  assert.equal(journal.entries[0].dryRun, true)
+  assert.equal(journal.entries[0].counted, false)
+  clock.advance(238_000)
+  await settle()
+  assert.equal(journal.entries.length, 1, '480s: the old 240-grid dry slot passes unused')
+  clock.advance(4_000)
+  await settle()
+  assert.equal(journal.entries.length, 2, 'dry pings move the base: the preview shows the real cadence')
+  assert.equal(Date.parse(journal.entries[1].ts) - Date.parse(journal.entries[0].ts), 242_000, 'without the base move the past due would clamp to 30s repeats')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 64. Config: empty {} entry adopts the built-in rule and really warms ---
+{
+  const { loadConfig } = await import('../lib/config.js')
+  const { makeStatsPayload } = await import('../lib/index.js')
+  const { mkdirSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-emptycfg-'))
+  const warnings = []
+  const warn = (m) => warnings.push(m)
+  try {
+    mkdirSync(join(tmp, 'a'), { recursive: true })
+    writeFileSync(join(tmp, 'a', 'config.json'), JSON.stringify({ providers: { mistral: {} } }))
+    const cfg = loadConfig(join(tmp, 'a'), warn)
+    assert.deepEqual(cfg.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 },
+      'an empty entry for a known provider adopts the built-in rule instead of dropping it')
+    assert.equal(warnings.filter((m) => m.includes('entry empty — adopting built-in scheduling')).length, 1,
+      'adoption warns exactly once')
+    assert.ok(!warnings.some((m) => m.includes('entry dropped') || m.includes('providers table is empty')),
+      'the named provider is neither dropped nor the table declared empty')
+
+    // The adopted rule is live: a tool window dispatches on the anchored grid.
+    const { warmer, clock, dispatches } = makeWarmer({ providers: cfg.providers })
+    warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const gate = { resolve: null }
+    const gatePromise = new Promise((r) => { gate.resolve = r })
+    const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+    clock.advance(241_000)
+    await settle()
+    assert.equal(dispatches.length, 0, 'nothing before the adopted anchored due')
+    clock.advance(1_000)
+    await settle()
+    assert.equal(dispatches.length, 1, 'the adopted defaults dispatch on the anchored schedule')
+    gate.resolve()
+    await toolPromise
+    warmer.dispose()
+
+    // The wire payload echoes the values actually in force, not the empty entry.
+    const payload = makeStatsPayload(null, cfg)
+    assert.deepEqual(payload.config.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000 },
+      'the stats route echoes the adopted rule')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 65. Config: ttlMs-only entry is kept; the grid slot defaults -------------
+{
+  const { loadConfig } = await import('../lib/config.js')
+  const { mkdirSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-ttlonly-'))
+  const warnings = []
+  const warn = (m) => warnings.push(m)
+  try {
+    mkdirSync(join(tmp, 'a'), { recursive: true })
+    writeFileSync(join(tmp, 'a', 'config.json'), JSON.stringify({ providers: { mistral: { ttlMs: 302_000 } } }))
+    const cfg = loadConfig(join(tmp, 'a'), warn)
+    assert.deepEqual(cfg.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 },
+      'ttlMs alone is a complete anchored rule; only the fallback grid reads intervalMs')
+    assert.ok(warnings.some((m) => m.includes('intervalMs missing — defaulted to 240000')),
+      'the defaulted grid slot warns once')
+    assert.ok(!warnings.some((m) => m.includes('entry dropped')), 'the entry is never dropped')
+
+    const { warmer, clock, dispatches } = makeWarmer({ providers: cfg.providers })
+    warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const gate = { resolve: null }
+    const gatePromise = new Promise((r) => { gate.resolve = r })
+    const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await gatePromise; return 'ok' })
+    clock.advance(241_000)
+    await settle()
+    assert.equal(dispatches.length, 0, 'nothing before the anchored due')
+    clock.advance(1_000)
+    await settle()
+    assert.equal(dispatches.length, 1, 'anchored dispatch on the kept ttlMs')
+    gate.resolve()
+    await toolPromise
+    warmer.dispose()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 66. Config: unknown provider with an empty entry still drops -------------
+{
+  const { loadConfig } = await import('../lib/config.js')
+  const { mkdirSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-unknown-'))
+  const warnings = []
+  const warn = (m) => warnings.push(m)
+  try {
+    mkdirSync(join(tmp, 'a'), { recursive: true })
+    writeFileSync(join(tmp, 'a', 'config.json'), JSON.stringify({ providers: { 'opencode-go': {} } }))
+    const cfg = loadConfig(join(tmp, 'a'), warn)
+    assert.deepEqual(cfg.providers, {}, 'no built-in rule to adopt: the unknown name drops')
+    assert.ok(warnings.some((m) => m.includes('providers["opencode-go"]') && m.includes('intervalMs invalid')),
+      'the drop warns loudly')
+    assert.ok(warnings.some((m) => m.includes('providers table is empty')), 'the empty table says so')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 67. Trace: a non-warmable capture drops loudly, never accepted-then-silence
+{
+  const events = []
+  const h = statsHarness({ providers: {} }, undefined, (event) => events.push(event))
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const streamLine = events.find((e) => e.ev === 'llm/stream')
+    assert.equal(streamLine.accepted, false,
+      'a capture whose provider is outside the warmed table is not accepted on the trace')
+    const drops = events.filter((e) => e.ev === 'drop')
+    assert.equal(drops.length, 1, 'exactly one drop event follows the capture')
+    assert.equal(drops[0].reason, 'provider-not-in-table')
+    assert.equal(drops[0].provider, 'mistral')
+    assert.equal(drops[0].model, 'zai-glm-5-3')
+    const tool = gateTool(h.warmer)
+    h.clock.advance(600_000)
+    await settle()
+    assert.equal(h.dispatches.length, 0, 'nothing ever dispatches for a provider outside the table')
+    assert.equal(h.journal.entries.length, 0, 'and nothing journals')
+    assert.equal(h.clock.pendingCount(), 0, 'no timer was ever armed')
     tool.gate.resolve()
     await tool.promise
     h.warmer.dispose()

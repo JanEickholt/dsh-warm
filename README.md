@@ -2,7 +2,7 @@
 
 Prompt-cache warmer for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), a host plugin. It keeps a session's provider prompt-cache prefix warm **while, and only while, the session's agent loop is blocked inside a tool execution** (long `bash`, `job_output`, `wait_agent` on teammates, and similar waits).
 
-It re-dispatches the session's **last conversation request** through the host `llm/stream` waterfall with `maxTokens: 1` on a fixed interval, then discards the 1-token response. The tool's result lands on the still-warm prefix, so the next real request bills cache-hit input instead of re-prefilling ~90k tokens at miss price and paying the full TTFT again.
+It re-dispatches the session's **last conversation request** through the host `llm/stream` waterfall with `maxTokens: 1` just before the provider's cache would expire (on a fixed `intervalMs` grid when no `ttlMs` is known), then discards the 1-token response. The tool's result lands on the still-warm prefix, so the next real request bills cache-hit input instead of re-prefilling ~90k tokens at miss price and paying the full TTFT again.
 
 ## Why only tool blocks
 
@@ -40,7 +40,7 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
 
 ## Configuration
 
-`$DSH_HOME/storages/dsh-warm/config.json` (written with defaults on first load; edit + restart). The ping interval is **per provider**, because the interval must sit under that provider's own prompt-cache TTL:
+`$DSH_HOME/storages/dsh-warm/config.json` (written with defaults on first load; edit + restart). The warming rule is **per provider**, because each provider's prompt-cache TTL is its own fact: with a measured or documented `ttlMs` the schedule is expiry-anchored — the anchored schedule pings at 302 s − 60 s = every 242 s, the last safe moment minus a minute's buffer. When `ttlMs` is set, `intervalMs` no longer drives scheduling — leave it in place: it stays the fallback grid if `ttlMs` is dropped and the stats TTL stand-in otherwise:
 
 ```json
 {
@@ -48,9 +48,9 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
   "dryRun": false,
   "maxPings": 5,
   "providers": {
-    "mistral":   { "intervalMs": 240000, "ttlMs": 302000 },
-    "openai":    { "intervalMs": 240000, "ttlMs": 300000 },
-    "anthropic": { "intervalMs": 240000, "ttlMs": 300000 }
+    "mistral":   { "intervalMs": 240000, "ttlMs": 302000, "marginMs": 60000 },
+    "openai":    { "intervalMs": 240000, "ttlMs": 300000, "marginMs": 60000 },
+    "anthropic": { "intervalMs": 240000, "ttlMs": 300000, "marginMs": 60000 }
   },
   "excludeTools": ["ask_user_question"],
   "minPrefixChars": 12000,
@@ -65,25 +65,27 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
 | --- | --- | --- |
 | `enabled` | `true` | master switch |
 | `dryRun` | `false` | journal would-be pings, dispatch nothing. Watch mode for a first deploy. |
-| `providers` | see above | **presence in the table = warm this provider**; each entry needs its own `intervalMs` and may override `maxPings` and `ttlMs` |
-| `maxPings` | `5` | ping cap per tool block when a provider entry doesn't override it (the prefix is stale past `maxPings × intervalMs` anyway) |
+| `providers` | see above | **presence in the table = warm this provider**; each entry may set `intervalMs`, `ttlMs` (expiry-anchored scheduling), `marginMs`, and `maxPings`. An entry left `{}` for a known provider adopts the built-in rule (console warn); a `ttlMs`-only entry is kept with `intervalMs` defaulted to 240000 (only the fallback grid reads it); unknown names with neither field warn + drop |
+| `maxPings` | `5` | ping cap per tool block when a provider entry doesn't override it (the prefix goes stale after `maxPings` refreshes anyway) |
 | `excludeTools` | `["ask_user_question"]` | user-idle-like waits with uncertain resume |
 | `minPrefixChars` | `12000` | skip tiny prefixes (≈chars/4 tokens); preventing a miss on them is not worth a ping |
 | `maxConcurrentPings` | `2` | global in-flight guard; over-cap pings retry in 5 s without consuming a slot |
 | `dailyPingBudget` | `300` | hard stop per UTC day, counted over real dispatch attempts (expected need ≈30/day) |
 | `pingTimeoutMs` | `90000` | abort a stalled ping stream |
-| `providers.*.ttlMs` | adopted per known provider | the provider's cache TTL floor, used by stats classification; `intervalMs` when a provider has no measured value. Warns when `ttlMs <= intervalMs` (the grid can never bridge the TTL) |
+| `providers.*.ttlMs` | adopted per known provider | the provider's cache TTL floor; when set, pings are expiry-anchored at `ttlMs − marginMs` after the last cache-refreshing event. Still the stats partition threshold. Warns when `ttlMs <= intervalMs` (the fallback grid can never bridge the TTL) |
+| `providers.*.marginMs` | `60000` | safety buffer subtracted from `ttlMs`: anchored pings fire `marginMs` before the cache would die. Must be `< ttlMs` — a violating pair drops `ttlMs` (console warn) and the provider falls back to the `intervalMs` grid. Ignored when `ttlMs` is absent. |
 | `stats.enabled` | `true` | stats counting + `stats.json` + the `/api/dsh-warm/stats` route's snapshot |
+| `debug` | `false` | append every observed event to `storages/dsh-warm/debug.jsonl` (diagnosis aid; off in normal operation) |
 
 ### Why these three providers
 
 Interval defaults are tied to each provider's own cache behavior. Measure before adding more:
 
-- **mistral** was measured on this setup (2026-10-17 live probe, `zai-glm-5-3`): hit at 302 s, miss at 424 s, so 240 s leaves about a minute of headroom.
+- **mistral** was measured on this setup (2026-10-17 live probe, `zai-glm-5-3`): hit at 302 s, miss at 424 s; the anchored schedule pings at 302 s − 60 s = every 242 s, the last safe moment minus a minute's buffer.
 - **openai** documents its cache as lasting "generally between 5 minutes and up to an hour"; 240 s stays under the short end.
 - **anthropic** documents a 5-minute TTL, refreshed on use; 240 s fits.
 - **deepseek** is deliberately absent. Its automatic disk cache outlives any sane ping grid (reports range from minutes to hours, and DeepSeek publishes no TTL), so a ping there every 4 minutes is pure waste. Add an entry only after measuring an actual TTL on your account.
-- **opencode-go / other proxies** are absent because their TTL is unmeasured. Probe first, then add e.g. `"opencode-go": { "intervalMs": 120000 }"`.
+- **opencode-go / other proxies** are absent because their TTL is unmeasured. Probe first, then add e.g. `"opencode-go": { "intervalMs": 120000 }"` — the `{}` shortcut only adopts defaults for the three providers above; an unknown name with an empty entry still drops (with a warn).
 
 A pre-table config (`warmProviders` + `intervalMs`) migrates automatically into the per-provider table with a console warning.
 
@@ -96,13 +98,32 @@ dsh-warm keeps its own ledger of what warming bought and what it wasted, indepen
 | counter | meaning |
 | --- | --- |
 | `warms` | pings dispatched |
-| `needless` | wasted: the follow-up request arrived within the provider TTL anyway, so the prefix was still warm without the ping |
+| `needless` | wasted: the follow-up arrived before `t0 + TTL`, where `t0` is the request that opened the block — the cache from the real request alone still carried it, so no ping bought anything. Judged per block, not per ping: on a dense grid every ping is individually bridgeable by its neighbor, yet the block as a whole was warm-anyway |
 | `noFollowup` | wasted: the tool block ended with no follow-up request at all (the turn went idle, or the session was disposed) |
 | `expired` | wasted: the follow-up needed the warm prefix but came more than TTL after the last successful ping, so the cache had already dropped |
-| `failed` | pings that errored (counted separately, never as waste) |
-| `savedCacheTokens` | cache-read tokens of the last successful ping in a block whose follow-up was necessary and arrived within TTL, i.e. what warming verifiably bought |
+| `failed` | pings whose own request errored or aborted (counted separately, never as waste) |
+| `savedCacheTokens` | cache-read tokens of the last successful ping in a block whose follow-up was necessary (arrived past `t0 + TTL`: without any ping the cache would have dropped) and still held (within TTL of that ping), i.e. what warming verifiably bought |
+| `models.*` | per-model slice of every counter above plus the token figures below; flat fields stay totals across models |
+| `pingCacheReadTokens` | per model, per outcome: the ping's own cache-read cost. `held` = necessary and the chain held — the cost that bought the credited follow-up; `needless`/`noFollowup`/`expired` = cost that bought nothing |
+| `pingUncachedTokens` | per model: the pings' uncached input tokens — the raw-price basis (cache misses pay here) |
+| `failedPingTokens` | all-time: failed pings' observed usage, `{ cacheRead, uncached }` — flat plus per-model `models.*.failedPingTokens` (schema 3); the flat field stays authoritative for pre-upgrade rows. In a file mixing epochs, flat exceeds the per-model sums by exactly the pre-upgrade rows; price flat for the all-time total, per-model for attribution |
+| `sessions` | per-session bucket shaped exactly like `allTime` (counts + `models`, no `day`), keyed by session id; at most the 50 most-recently-active sessions, pruned at every write — pruned sessions keep their today/allTime/byDay numbers, only their own bucket is gone |
 
-Approximations, by design: classification compares request/ping timestamps against the configured `ttlMs`, not provider-side cache state. A ping that reported a miss (`cacheReadTokens` 0) is never credited. After a crash (no clean dispose) the boot reseeds `warms`/`failed` from `warm.jsonl` but leaves outcome counters at zero, because outcomes need the follow-up request that happened after the journal line. Stats are written to `storages/dsh-warm/stats.json` (atomic rename, UTC-day buckets).
+**Outcome semantics** — counts are pings, not prices, and `expired` is not `failed`:
+
+- Every count row counts pings. The three waste rows are judged per block — one follow-up classifies all of that block's non-failed pings at once, so a single block that lost the cover can add several pings to `expired`.
+- `expired` pings succeeded as requests. Each ping's own bill is measured separately and rides the token ledger: its cache-read tokens in `models.*.pingCacheReadTokens.expired`, its uncached input — the tail a cache hit still pays, or the whole prefix when the ping itself fired at a dead cache — in `models.*.pingUncachedTokens`. `expired: 5` is not five full-price re-prefills.
+- The re-prefill the follow-up paid on the dead cache is not in this ledger at all; the follow-up is a normal request, billed like any other outside these fields.
+- `failed` is the ping's own request erroring or aborting (provider timeout, user interrupt) — provider mechanics, all-time, priced via `failedPingTokens`, never a waste row. `expired` is a cadence signal: the cover lapsed before the follow-up (cap reached, budget gate, or a failed ping breaking the refresh chain). Tune `marginMs`/`maxPings`/`dailyPingBudget` against `expired`, the provider against `failed`.
+- `warms` counts at dispatch, so it includes failed pings and pings of blocks still open; the waste rows fill only when a follow-up (or idle/disposal) closes the block. Pings that verifiably carried a follow-up are not a counter: all-time `warms − failed − needless − noFollowup − expired` counts them plus the still-open or teardown-dropped pings, which is why consumers label that residual "held or open".
+
+dsh-warm ships tokens only — it holds no prices. Consumers price the story themselves: the benefit side is `savedCacheTokens × input price` (gross — the follow-up still paid its own hit price for those tokens); the cost side is the pings' measured spend, per model: every `pingCacheReadTokens` figure at the cache-read price plus `pingUncachedTokens` at the input price, and — schema 3 — the per-model `failedPingTokens.cacheRead` at the cache-read price and `failedPingTokens.uncached` at the input price (all-time scope; pre-upgrade rows carry the flat totals, and the flat field stays authoritative for them).
+
+For the dsh-context card's money legend: Saved = `savedCacheTokens` × miss price; Useful spend = `pingCacheReadTokens.held` × hit price; Wasted spend = waste-bucket `pingCacheReadTokens` + failed `failedPingTokens.cacheRead` (per-model; flat in the legacy fallback) × hit price; Full-price spend = `pingUncachedTokens` (+ per-model `failedPingTokens.uncached`) × miss price.
+
+Approximations, by design: classification compares request/ping timestamps against the configured `ttlMs`, not provider-side cache state. A ping that reported a miss (`cacheReadTokens` 0) is never credited. After a crash (no clean dispose) the boot reseeds `warms`/`failed` from `warm.jsonl` but leaves outcome counters at zero, because outcomes need the follow-up request that happened after the journal line. Of the token figures, per-model `pingUncachedTokens` and `failedPingTokens` reseed from the journal's recorded usage; only the per-outcome `pingCacheReadTokens` split stays zero with the counters. Usage a stream never surfaced counts as zero (failed pings too). A `stats.json` written before the per-model maps boots as-is: the absent maps start empty and the historical flat counts ride unchanged. The same holds per session: buckets count only post-upgrade attribution, a fresh boot reconstructs per-session `warms` from the journal's `sessionId`, and the recency timestamp behind the 50-session bound is internal — it never appears on the route. Stats are written to `storages/dsh-warm/stats.json` (atomic rename, UTC-day buckets).
+
+**Diagnosing counts:** set `"debug": true` and restart the harness; every observed `llm/stream`, tool window, ping, and chain partition is then appended to `storages/dsh-warm/debug.jsonl`, which shows exactly which event an outcome bucket missed. Each `chain.close` carries the two numbers the partition compares — `gap` (follow-up minus the block's opening request) and `ttl`. Turn it off when done.
 
 **Toggle:** `"stats": { "enabled": true }`, on by default. Off means no counting, no `stats.json`, and the route below serves `"statsEnabled": false, "stats": null` so consumers can render the state instead of guessing.
 
@@ -110,13 +131,59 @@ Approximations, by design: classification compares request/ping timestamps again
 
 ```json
 {
-  "schema": 1,
+  "schema": 3,
   "statsEnabled": true,
   "stats": {
-    "today":   { "day": "2026-10-20", "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152 },
-    "allTime": { "warms": 12, "needless": 1, "noFollowup": 2, "expired": 1, "savedCacheTokens": 4608 },
-    "byDay":   { "2026-10-20": { "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152 } },
-    "failed": 0
+    "today": {
+      "day": "2026-10-20", "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+      "models": {
+        "zai-glm-5-3": {
+          "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+          "pingCacheReadTokens": { "held": 180000, "needless": 0, "noFollowup": 90000, "expired": 0 },
+          "pingUncachedTokens": 1200,
+          "failedPingTokens": { "cacheRead": 0, "uncached": 0 }
+        }
+      }
+    },
+    "allTime": {
+      "warms": 12, "needless": 1, "noFollowup": 2, "expired": 1, "savedCacheTokens": 4608,
+      "models": {
+        "zai-glm-5-3": {
+          "warms": 12, "needless": 1, "noFollowup": 2, "expired": 1, "savedCacheTokens": 4608,
+          "pingCacheReadTokens": { "held": 720000, "needless": 90000, "noFollowup": 180000, "expired": 90000 },
+          "pingUncachedTokens": 130000,
+          "failedPingTokens": { "cacheRead": 24000, "uncached": 8000 }
+        }
+      }
+    },
+    "byDay": {
+      "2026-10-20": {
+        "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+        "models": {
+          "zai-glm-5-3": {
+            "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+            "pingCacheReadTokens": { "held": 180000, "needless": 0, "noFollowup": 90000, "expired": 0 },
+            "pingUncachedTokens": 1200,
+            "failedPingTokens": { "cacheRead": 0, "uncached": 0 }
+          }
+        }
+      }
+    },
+    "failed": 2,
+    "failedPingTokens": { "cacheRead": 24000, "uncached": 8000 },
+    "sessions": {
+      "34955360-85de-4149-9981-bc7f2904ab29": {
+        "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+        "models": {
+          "zai-glm-5-3": {
+            "warms": 3, "needless": 0, "noFollowup": 1, "expired": 0, "savedCacheTokens": 1152,
+            "pingCacheReadTokens": { "held": 180000, "needless": 0, "noFollowup": 90000, "expired": 0 },
+            "pingUncachedTokens": 1200,
+            "failedPingTokens": { "cacheRead": 0, "uncached": 0 }
+          }
+        }
+      }
+    }
   },
   "config": {
     "providers": { "mistral": { "intervalMs": 240000, "ttlMs": 302000 } },
@@ -125,6 +192,8 @@ Approximations, by design: classification compares request/ping timestamps again
   }
 }
 ```
+
+In `config.providers`, an entry that sets `maxPings` echoes it as a third, optional field.
 
 The route sits behind the harness's authenticated `/api` fence (no separate auth; same fence as the harness's own routes) and exists whenever the plugin is enabled, also when stats are off, so the toggle state is visible.
 

@@ -103,7 +103,7 @@ window.__ModuleLoader__.load({
         el('b', { className: 'dwf-warn' }, fmt(stats.today?.needless)),
         el('span', { className: 'dwf-warn' }, 'wasted: no follow-up'),
         el('b', { className: 'dwf-warn' }, fmt(stats.today?.noFollowup)),
-        el('span', { className: 'dwf-warn' }, 'wasted: expired'),
+        el('span', { className: 'dwf-warn' }, 'wasted: follow-up too late'),
         el('b', { className: 'dwf-warn' }, fmt(stats.today?.expired)),
         el('span', null, 'failed pings'),
         el('b', null, fmt(stats.failed)))

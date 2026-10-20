@@ -52,6 +52,12 @@ covers what it does and why; this file covers what silently breaks.
   mid-ping would otherwise catch up off the not-yet-counted slot and
   double-dispatch). The budget gate counts in-flight pings for the same
   reason across sessions.
+- `st.refreshBase` is the last proof of warmth — the anchor capture's ts,
+  a successful ping's dispatch ts, or dry-run now(); exactly three write
+  sites (onLlmStream accepted, epochLive ping settle, dry-run dispatch).
+  The anchored due is `refreshBase + ttlMs − marginMs`; a superseded
+  ping's settle must never write it (the base would regress and the
+  next epoch's ping would arm too early).
 - `journal.pingsToday()` must self-rollover at UTC midnight: the budget
   gates call it before `record()` can ever run again, so `record()`-only
   rollover freezes an exhausted budget for the process lifetime.
@@ -59,6 +65,27 @@ covers what it does and why; this file covers what silently breaks.
   (`reason.kind: 'error' | 'aborted'` with `reason.failure`), not thrown
   errors — track the finish chunk in the consume loop, not just
   try/catch.
+- Debug trace (`config.debug: true`): lib/index.js builds an
+  appendFileSync sink to `storages/dsh-warm/debug.jsonl` and passes it to
+  both engines as `deps.debug`; warmer logs every `llm/stream`
+  (pre-guard, with `accepted`), tool window, status, ping dispatch/settle;
+  stats logs every chain event with the partition outcome. It is a
+  diagnosis channel only — behavior must be identical with the sink
+  absent (the suite runs all scenarios but the trace scenario (67) with
+  `debug: null`).
+- Empty-entry adoption (lib/config.js) and the trace that proves it: a
+  `providers` entry with neither `intervalMs` nor `ttlMs` for a provider
+  named in `DEFAULT_CONFIG.providers` adopts the built-in rule with one
+  warn — dropping it would silently disable warming for a provider the
+  user named on purpose; a `ttlMs`-only entry is kept with `intervalMs`
+  defaulted 240000 (anchored scheduling never reads it); unknown names
+  with neither field still warn + drop. In lib/warmer.js the
+  `llm/stream` trace line's `accepted` flag means arm-able capture, and
+  a capture whose provider is outside the warmed table logs
+  `{ ev: 'drop', reason: 'provider-not-in-table', provider, model }`
+  right after — a capture whose provider is outside the warmed table
+  must never show `accepted: true` followed by silence; that is a trace
+  bug.
 
 ## Tests (`npm test` → test/verify.mjs, fake clock + fake timers)
 
@@ -94,8 +121,17 @@ covers what it does and why; this file covers what silently breaks.
   fence, no hand-rolled auth. Guard the register call; hosts without the
   connection service just lack the route.
 - Wire payload (`makeStatsPayload` in lib/index.js) is a documented
-  stable schema (`schema: 1`): change shape only behind a schema bump,
-  and mirror the change in the README route example.
+  stable schema (`schema: 3`): change shape only behind a schema bump,
+  and mirror the change in the README route example. Schema 3 adds
+  per-model `failedPingTokens` maps (`models.<id>.failedPingTokens`,
+  all-time); the flat top-level `failedPingTokens` is the complete
+  all-time total and stays authoritative for pre-upgrade rows — in a
+  file mixing epochs flat exceeds the per-model sums by exactly those
+  rows, and post-upgrade increments keep the sums equal. Schema 2 added
+  per-model `models` maps, all-time flat `failedPingTokens`, and the
+  bounded `sessions` map; flat count fields are complete totals in the
+  same sense (pre-upgrade rows can widen a flat-vs-models gap; only
+  post-upgrade increments are guaranteed to match).
 - Client smoke test (scenario 46) evaluates the factory with a stubbed
   `require('react')` and a mock slots service — react is NOT a repo
   dependency and must never become one.

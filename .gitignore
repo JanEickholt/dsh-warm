@@ -1,3 +1,9 @@
 node_modules/
 *.log
 .DS_Store
+# Keep CHANGELOG.md trackable despite global *.md excludes.
+!CHANGELOG.md
+.slim/deepwork/
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps

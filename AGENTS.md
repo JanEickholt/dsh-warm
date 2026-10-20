@@ -72,3 +72,41 @@ covers what it does and why; this file covers what silently breaks.
 - The suite must stay green before any change to `lib/`. After host-side
   changes, the harness must be restarted from a terminal — a restart
   kills the host process, so never trigger it from inside a session.
+
+## Client half (`client/index.js`)
+
+- Hand-written CJS factory, `window.__ModuleLoader__.load({ id,
+  factory })`, exactly dsh-cost-meter's form: a single closure, `react`
+  from the shell baseline, no build step, no bundler. Exports
+  `name`/`inject`/`apply` like the host plugin.
+- `lib/`'s zero-import rule does NOT apply to `client/` — the factory
+  `require()`s shell-baseline modules (today only `react`). Keep the
+  list minimal; every new require must exist in the shell baseline.
+- Slots: `sidebar.footer.action` (id `dsh-warm-stats`) and the keyed
+  `plugins.bundle.config` card (key `dsh-warm`, the package name — the
+  Plugins page keys occupants by bundle). `slots.inject(name, factory)`
+  is enough; contributions leave with the plugin fiber.
+- The client fetches `api/dsh-warm/stats` RELATIVE — never a leading
+  slash (reverse proxies drop path prefixes; dsh-context convention).
+- Route: `ctx.inject(['connection'], ...)` →
+  `connection.fetch.register({ path: '/api/dsh-warm/stats', methods:
+  ['GET'], requestBody: 'buffered', fetch })` — the authenticated `/api`
+  fence, no hand-rolled auth. Guard the register call; hosts without the
+  connection service just lack the route.
+- Wire payload (`makeStatsPayload` in lib/index.js) is a documented
+  stable schema (`schema: 1`): change shape only behind a schema bump,
+  and mirror the change in the README route example.
+- Client smoke test (scenario 46) evaluates the factory with a stubbed
+  `require('react')` and a mock slots service — react is NOT a repo
+  dependency and must never become one.
+- After client-side changes the harness must be restarted from a
+  terminal and the page refreshed for the new bundle to load.
+
+## Cloned Dependency Source
+
+Read-only dependency source repositories are available under
+`.slim/clonedeps/` for inspection. Do not edit these clones.
+
+- `.slim/clonedeps/repos/deepseek-ai__deepseek-harness/`: `github.com/deepseek-ai/deepseek-harness` at `master` (687f282); upstream source of the installed DSH packages — client-plugin API facts (slot catalog, `dsh.client` declaration, `sessionProjections`, `connection.fetch`).
+- `.slim/clonedeps/repos/bowenliang123__dsh-context/`: `github.com/bowenliang123/dsh-context` at `c22ccb2` (v0.73.3); third-party Context Insights plugin — extension-surface facts and interop boundary for dsh-warm stats (it exposes no foreign-extension surface today).
+- `.slim/clonedeps/repos/helloxkk__dsh-scope/`: `github.com/helloxkk/dsh-scope` at `439e009` (v0.3.0); precedent for a hand-written CJS client half plus a `connection.fetch` host route.

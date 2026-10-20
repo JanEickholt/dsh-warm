@@ -35,6 +35,12 @@ window.__ModuleLoader__.load({
     const PANEL_POLL_MS = 15_000
 
     const fmt = (n) => (n === null || n === undefined ? '–' : String(n))
+    // Cost-meter's sidebar abbreviation: plain below 1e3, K below 999.5e3, then M.
+    const fmtCompact = (n) => {
+      const v = Math.max(0, Number(n) || 0)
+      const short = (a) => (a >= 100 ? String(Math.round(a)) : String(Math.round(a * 10) / 10))
+      return v < 1e3 ? String(Math.round(v)) : v < 999500 ? `${short(v / 1e3)}K` : `${short(v / 1e6)}M`
+    }
 
     async function fetchStats() {
       const res = await fetch(STATS_URL)
@@ -46,10 +52,30 @@ window.__ModuleLoader__.load({
 
     const css = [
       '/* dsh-warm: sidebar row + stats panel */',
-      '.dwf-item{display:flex;align-items:center;gap:6px;cursor:pointer;padding:2px 6px;margin:0 -6px;border-radius:6px;font-size:12px;',
-      ' color:var(--dsw-alias-label-secondary);}',
-      '.dwf-item:hover{background:var(--dsw-alias-bg-hover);color:var(--dsw-alias-interactive-text-hover);}',
-      '.dwf-item .dwf-num{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;}',
+      // Expanded state copies cost-meter's boxed footer (measured live):
+      // bordered skin, left-aligned 12px/400 secondary row, bg-only hover.
+      // The container query restores cost's collapsed borderless centered rail.
+      // order:2 and min-width:32px are base rules on purpose — a container
+      // query cannot restyle the container element itself. order keeps warm
+      // below cost's self-reordering stack (-1 expanded → 1 collapsed) in
+      // both states; min-width keeps the collapsed rail visible without
+      // cost-meter (inline-size containment zeroes intrinsic width).
+      '.dwf-box{width:100%;min-width:32px;order:2;container-type:inline-size;}',
+      '.dwf-skin{width:100%;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;',
+      ' background:var(--dsw-alias-bg-layer-1);}',
+      '.dwf-item{display:flex;align-items:center;justify-content:flex-start;gap:6px;width:100%;box-sizing:border-box;',
+      ' height:26px;padding:0 8px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:400;',
+      ' color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;}',
+      '.dwf-item:hover{background:var(--dsw-alias-interactive-bg-hover);}',
+      '.dwf-ico{display:none;}',
+      '@container (max-width:80px){.dwf-skin{border:0;background:transparent}',
+      ' .dwf-item{justify-content:center;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+      ' .dwf-item span{display:none}',
+      ' .dwf-ico{display:block;flex:none}}',
+      // Joins warm's box flush onto cost-meter's adjacent .cm-footer-stack
+      // (its literal, non-hashed class): single hairline seam, cost's stack
+      // silhouette. Safe no-op when cost-meter is absent or not adjacent.
+      '@container (min-width:81px){.cm-footer-stack + .dwf-box .dwf-skin{border-top:0;margin-top:-1px;border-radius:0 0 10px 10px}}',
       '.dwf-panel{position:fixed;z-index:60;width:280px;max-height:70vh;overflow:auto;',
       ' background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l);border-radius:10px;',
       ' box-shadow:0 8px 24px rgba(0,0,0,.18);padding:10px 12px;font-size:12px;color:var(--dsw-alias-label-primary);}',
@@ -121,7 +147,7 @@ window.__ModuleLoader__.load({
 
     // ── sidebar footer row + panel ─────────────────────────────────────────
 
-    function WarmPanel({ onClose, ignoreRef }) {
+    function WarmPanel({ onClose, ignoreRef, pos }) {
       const [state, setState] = useState(undefined)
       const [error, setError] = useState(null)
       const ref = useRef(null)
@@ -155,7 +181,7 @@ window.__ModuleLoader__.load({
         }
       }, [onClose, ignoreRef])
 
-      return el('div', { ref, className: 'dwf-panel' },
+      return el('div', { ref, className: 'dwf-panel', style: pos },
         el('h4', null, 'dsh-warm stats'),
         error ? el('div', { className: 'dwf-err' }, `stats unavailable: ${error}`) : el(StatsGrid, { state }),
         el('div', { className: 'dwf-sub' }, 'provider grid'),
@@ -199,29 +225,37 @@ window.__ModuleLoader__.load({
 
       mountCss()
       const today = state?.stats?.today
-      const row = el('div', {
-        ref: anchorRef,
-        className: 'dwf-item',
-        onClick: () => {
-          // Measure while still closed: the panel anchors above this row.
-          if (!open && anchorRef.current?.getBoundingClientRect) {
-            const rect = anchorRef.current.getBoundingClientRect()
-            panelPosRef.current = { left: `${Math.round(rect.left)}px`, bottom: `${Math.round(window.innerHeight - rect.top) + 8}px` }
-          }
-          toggle()
-        },
-        onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle() } },
-        role: 'button',
-        tabIndex: 0,
-      },
-        el('span', null, 'Warm'),
-        today ? el('span', { className: 'dwf-num' }, `${fmt(today.warms)}w`) : null,
-        today && today.savedCacheTokens ? el('span', { className: 'dwf-num' }, `${fmt(today.savedCacheTokens)} saved`) : null)
+      // Cost-style single span: "Today 6 warms · 256K saved". "Warm" is the
+      // quiet placeholder until today's payload lands (or the route fails).
+      const text = today
+        ? `Today ${fmtCompact(today.warms)} warms${today.savedCacheTokens ? ` · ${fmtCompact(today.savedCacheTokens)} saved` : ''}`
+        : 'Warm'
+      const activate = () => {
+        // Measure while still closed: the panel anchors above this row.
+        if (!open && anchorRef.current?.getBoundingClientRect) {
+          const rect = anchorRef.current.getBoundingClientRect()
+          panelPosRef.current = { left: `${Math.round(rect.left)}px`, bottom: `${Math.round(window.innerHeight - rect.top) + 8}px` }
+        }
+        toggle()
+      }
+      const row = el('div', { className: 'dwf-box' },
+        el('div', { className: 'dwf-skin' },
+          el('div', {
+            ref: anchorRef,
+            className: 'dwf-item',
+            title: text,
+            onClick: activate,
+            onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } },
+            role: 'button',
+            tabIndex: 0,
+          },
+            el('svg', { className: 'dwf-ico', width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': 'true', fill: 'currentColor' },
+              el('path', { d: 'M8 2.25c1.25 1.625 2.5 2.875 2.5 4.375a2.5 2.5 0 0 1-5 0c0-1.5 1.25-2.75 2.5-4.375z' })),
+            el('span', null, text))))
       if (!open) return row
       return el(React.Fragment, null,
         row,
-        el('div', { style: panelPosRef.current ?? { left: '12px', bottom: '48px' } },
-          el(WarmPanel, { onClose: () => setOpen(false), ignoreRef: anchorRef })))
+        el(WarmPanel, { onClose: () => setOpen(false), ignoreRef: anchorRef, pos: panelPosRef.current ?? { left: '12px', bottom: '48px' } }))
     }
 
     // ── Plugins page card ──────────────────────────────────────────────────

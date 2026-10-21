@@ -85,7 +85,20 @@ Interval defaults are tied to each provider's own cache behavior. Measure before
 - **openai** documents its cache as lasting "generally between 5 minutes and up to an hour"; 240 s stays under the short end.
 - **anthropic** documents a 5-minute TTL, refreshed on use; 240 s fits.
 - **deepseek** is deliberately absent. Its automatic disk cache outlives any sane ping grid (reports range from minutes to hours, and DeepSeek publishes no TTL), so a ping there every 4 minutes is pure waste. Add an entry only after measuring an actual TTL on your account.
-- **opencode-go / other proxies** are absent because their TTL is unmeasured. Probe first, then add e.g. `"opencode-go": { "intervalMs": 120000 }"` — the `{}` shortcut only adopts defaults for the three providers above; an unknown name with an empty entry still drops (with a warn).
+- **opencode** is absent: the free models live on `zen/v1`, whose floors are measured (subsection below), but zen's free-tier gate blocks dsh-warm's own pings; the `go` endpoint — the `opencode-go` provider's surface — is a separate, unmeasured cache. Other proxies likewise: probe first, then add e.g. `"opencode-go": { "intervalMs": 120000 }"` — the `{}` shortcut only adopts defaults for the three providers above; an unknown name with an empty entry still drops (with a warn).
+
+#### OpenCode free models — measured zen floors (2026-10-20)
+
+Probed live through the genuine opencode client (v2.0.3) because zen's free-tier gate answers raw HTTP clients with `403 FreeTierError "OpenCode's free tier can only be used from within OpenCode"` — dsh-warm cannot ping these models itself, so the numbers are documentation until DSH routes through the opencode client or a fingerprint-accurate proxy. Method: per model, a dedicated client session primed with a fixed ~14k-char prefix (~10k tokens); resends append a tiny follow-up; hit = the resend's `tokens.cache.read` ≈ the prefix, fragment = a constant tiny residue (123/128/191 tokens), miss = 0.
+
+| model (`zen/v1` free) | measured floor | conservative `ttlMs` |
+| --- | --- | --- |
+| `glm-5.3-flash-free` | (270, 300] s — miss at 300 | `270000` |
+| `deepseek-v4.1-flash-free` | (420, 600) s — 600 s jittery | `420000` |
+| `minimax-m3.1-flash-free` | ≥ 420 s — 600 s full once, fragment once | `420000` |
+| `big-pickle` | (600, 900) s — 900 s fragments | `600000` |
+
+Hits refresh the cache: each ladder's later rungs hit at cumulative ages far beyond the model's single-dwell floor (up to 1,349 s), so an interval below the floor sustains the cache indefinitely; `marginMs` 60000 applies as usual. Free ids rotate (`space-bunny-free` died upstream) — re-check `GET /zen/v1/models` before relying on one. The `go` endpoint (paid models plus its own free ids) has no measured TTL yet; probe it before adding any `opencode-go` entry.
 
 A pre-table config (`warmProviders` + `intervalMs`) migrates automatically into the per-provider table with a console warning.
 

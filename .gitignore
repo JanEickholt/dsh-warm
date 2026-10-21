@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 *.log
 .DS_Store
 # Keep CHANGELOG.md trackable despite global *.md excludes.

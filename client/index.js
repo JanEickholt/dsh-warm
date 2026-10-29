@@ -118,20 +118,24 @@ window.__ModuleLoader__.load({
       }
       if (!stats) return el('div', { className: 'dwf-err' }, 'no stats payload')
       const allTime = stats.allTime ?? {}
+      // Every row names its period: today's counters first, then all-time
+      // (`failed` exists only all-time on the wire).
       return el('div', { className: 'dwf-grid' },
         el('span', null, 'warms (today)'),
         el('b', null, fmt(stats.today?.warms)),
+        el('span', null, 'saved cache tokens (today)'),
+        el('b', null, fmt(stats.today?.savedCacheTokens)),
+        el('span', { className: 'dwf-warn' }, 'wasted: needless (today)'),
+        el('b', { className: 'dwf-warn' }, fmt(stats.today?.needless)),
+        el('span', { className: 'dwf-warn' }, 'wasted: no follow-up (today)'),
+        el('b', { className: 'dwf-warn' }, fmt(stats.today?.noFollowup)),
+        el('span', { className: 'dwf-warn' }, 'wasted: follow-up too late (today)'),
+        el('b', { className: 'dwf-warn' }, fmt(stats.today?.expired)),
         el('span', null, 'warms (all-time)'),
         el('b', null, fmt(allTime.warms)),
-        el('span', null, 'saved cache tokens'),
-        el('b', null, fmt(stats.today?.savedCacheTokens)),
-        el('span', { className: 'dwf-warn' }, 'wasted: needless'),
-        el('b', { className: 'dwf-warn' }, fmt(stats.today?.needless)),
-        el('span', { className: 'dwf-warn' }, 'wasted: no follow-up'),
-        el('b', { className: 'dwf-warn' }, fmt(stats.today?.noFollowup)),
-        el('span', { className: 'dwf-warn' }, 'wasted: follow-up too late'),
-        el('b', { className: 'dwf-warn' }, fmt(stats.today?.expired)),
-        el('span', null, 'failed pings'),
+        el('span', null, 'saved cache tokens (all-time)'),
+        el('b', null, fmt(allTime.savedCacheTokens)),
+        el('span', null, 'failed pings (all-time)'),
         el('b', null, fmt(stats.failed)))
     }
 

@@ -2550,4 +2550,31 @@ const gateTool = (warmer, sid = 's1') => {
   }
 }
 
+// --- 68. Debug trace rolls instead of growing without bound ------------------
+// Live finding: a debug:true host grew debug.jsonl to 43 MB in nine days (the
+// journal rolls at 5 MB; the trace had no bound at all).
+{
+  const { makeDebugSink } = await import('../lib/index.js')
+  const { statSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-debug-'))
+  try {
+    const path = join(tmp, 'debug.jsonl')
+    writeFileSync(path, 'x'.repeat(5000) + '\n') // a pre-existing oversized trace from an earlier boot
+    const sink = makeDebugSink(path, { rollBytes: 4096 })
+    sink({ ev: 'first' })
+    assert.ok(existsSync(`${path}.1`), 'an oversized trace found at boot rolls on the first event')
+    assert.ok(readFileSync(`${path}.1`, 'utf8').startsWith('xxx'), 'the old trace is kept as .1')
+    assert.equal(JSON.parse(readFileSync(path, 'utf8').trim()).ev, 'first', 'the live trace restarts with the new event')
+    for (let i = 0; i < 200; i++) sink({ ev: 'fill', pad: 'p'.repeat(100) })
+    assert.ok(statSync(path).size <= 4096 + 512, 'the live trace stays near the roll threshold')
+    assert.ok(statSync(`${path}.1`).size <= 4096 + 512, 'the rolled trace replaced the boot-time one: at most two files, both bounded')
+    sink({ ev: 'tail' })
+    const lines = readFileSync(path, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.equal(lines.at(-1).ev, 'tail')
+    assert.equal(typeof lines.at(-1).ts, 'string', 'every line keeps its ts stamp')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

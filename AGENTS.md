@@ -66,7 +66,9 @@ covers what it does and why; this file covers what silently breaks.
   errors — track the finish chunk in the consume loop, not just
   try/catch.
 - Debug trace (`config.debug: true`): lib/index.js builds an
-  appendFileSync sink to `storages/dsh-warm/debug.jsonl` and passes it to
+  appendFileSync sink (`makeDebugSink`, rolls to `debug.jsonl.1` past
+  16 MB — unbounded it reached 43 MB in nine live days) to
+  `storages/dsh-warm/debug.jsonl` and passes it to
   both engines as `deps.debug`; warmer logs every `llm/stream`
   (pre-guard, with `accepted`), tool window, status, ping dispatch/settle;
   stats logs every chain event with the partition outcome. It is a

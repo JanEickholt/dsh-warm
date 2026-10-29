@@ -2607,4 +2607,74 @@ const gateTool = (warmer, sid = 's1') => {
   }
 }
 
+// --- 70. Tool opening past the due fires now, not one margin-half later ------
+// The response can stream past refreshBase + ttl - margin before the tool
+// starts. The margin-half backoff is for retries after an attempt; on the
+// first arm it spent 30 s of a 60 s margin and could land the ping past the
+// TTL floor.
+{
+  const { warmer, clock, dispatches } = makeWarmer()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  clock.advance(280_000) // the response streamed for 280 s; due was 242 s
+  const gate = { resolve: null }
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gate.resolve = r }); return 'ok' })
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'a late tool start pings within a second, still inside the 302 s floor')
+  // The successful ping moved the base to 281 s: the next one is anchored again.
+  clock.advance(241_000)
+  await settle()
+  assert.equal(dispatches.length, 1)
+  clock.advance(1_000)
+  await settle()
+  assert.equal(dispatches.length, 2, 'the cadence re-anchors on the ping: 281 + 242 s')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 71. Idle releases the capture: no ping source before the next one ------
+// The next turn always opens with a fresh capture; a tool that runs first
+// (running again, no llm/stream yet) must not ping the previous turn's request.
+{
+  const { warmer, clock, dispatches } = makeWarmer()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'idle' })
+  clock.advance(60_000)
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  const gate = { resolve: null }
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gate.resolve = r }); return 'ok' })
+  clock.advance(600_000)
+  await settle()
+  assert.equal(dispatches.length, 0, 'the previous turn\'s request is never replayed')
+  assert.equal(clock.pendingCount(), 0, 'nothing armed without a capture')
+  // A fresh capture inside the still-open block re-arms normally.
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  clock.advance(242_000)
+  await settle()
+  assert.equal(dispatches.length, 1, 'the new capture warms as usual')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
+// --- 72. Non-warmable capture supersedes a warmable one, holds nothing -------
+{
+  const { warmer, clock, dispatches } = makeWarmer()
+  warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+  warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+  const other = Object.freeze({ ...conversationRequest, provider: 'opencode-go', model: 'deepseek-v4.1-flash' })
+  warmer.onLlmStream(other, () => [])[Symbol.iterator]()
+  const gate = { resolve: null }
+  const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gate.resolve = r }); return 'ok' })
+  clock.advance(600_000)
+  await settle()
+  assert.equal(dispatches.length, 0, 'the earlier mistral request is not replayed after the session moved off the table')
+  gate.resolve()
+  await toolPromise
+  warmer.dispose()
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

@@ -58,6 +58,16 @@ covers what it does and why; this file covers what silently breaks.
   The anchored due is `refreshBase + ttlMs − marginMs`; a superseded
   ping's settle must never write it (the base would regress and the
   next epoch's ping would arm too early).
+- An anchored due already in the past re-arms at `marginMs / 2` only after
+  an attempt in this epoch (`st.pings > 0`: a failed ping's retry). With no
+  attempt yet the tool merely opened late (the response streamed past the
+  due) and the ping fires in 1 s — the backoff there would spend half the
+  margin and can land past the TTL floor.
+- `st.lastOptions` holds only an arm-able capture: a capture outside the
+  warmed table stores `null` (it still bumps the epoch and supersedes), and
+  idle clears it. The next turn always opens with a fresh capture, so the
+  previous turn's request is never a ping source — and never pinned in
+  memory for the session's lifetime.
 - `journal.pingsToday()` must self-rollover at UTC midnight: the budget
   gates call it before `record()` can ever run again, so `record()`-only
   rollover freezes an exhausted budget for the process lifetime.

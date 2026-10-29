@@ -68,7 +68,7 @@ covers what it does and why; this file covers what silently breaks.
   idle clears it. The next turn always opens with a fresh capture, so the
   previous turn's request is never a ping source — and never pinned in
   memory for the session's lifetime.
-- `journal.pingsToday()` must self-rollover at UTC midnight: the budget
+- `journal.pingsToday()` must self-rollover at local midnight: the budget
   gates call it before `record()` can ever run again, so `record()`-only
   rollover freezes an exhausted budget for the process lifetime.
 - Provider failures arrive as terminal finish chunks
@@ -107,7 +107,12 @@ covers what it does and why; this file covers what silently breaks.
 - The concurrency scenario asserts shared-grid serialization across two
   `advance()` calls (3 then 4 dispatches), not one big advance.
 - Scenario 18 uses a real `openJournal` in a tmp dir — it exists to prove
-  the UTC-midnight budget reset; keep it on the real journal.
+  the midnight budget reset; keep it on the real journal.
+- Days are host-local (`localDayKey`). The suite pins `process.env.TZ =
+  'UTC'` at the top because its fixtures are UTC instants; scenarios that
+  prove local-day behavior (74-76) set another zone and restore UTC in
+  `finally`. Never drop the pin: the suite would pass or fail by the
+  machine's zone.
 - The suite must stay green before any change to `lib/`. After host-side
   changes, the harness must be restarted from a terminal — a restart
   kills the host process, so never trigger it from inside a session.

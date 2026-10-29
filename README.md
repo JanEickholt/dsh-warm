@@ -70,7 +70,7 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
 | `excludeTools` | `["ask_user_question"]` | user-idle-like waits with uncertain resume |
 | `minPrefixChars` | `12000` | skip tiny prefixes (≈chars/4 tokens); preventing a miss on them is not worth a ping |
 | `maxConcurrentPings` | `2` | global in-flight guard; over-cap pings retry in 5 s without consuming a slot |
-| `dailyPingBudget` | `300` | hard stop per UTC day, counted over real dispatch attempts (expected need ≈30/day) |
+| `dailyPingBudget` | `300` | hard stop per local calendar day, counted over real dispatch attempts (expected need ≈30/day). Recounted from the journal when another host sharing `$DSH_HOME` appended, so side-by-side profiles share one budget |
 | `pingTimeoutMs` | `90000` | abort a stalled ping stream |
 | `providers.*.ttlMs` | adopted per known provider | the provider's cache TTL floor; when set, pings are expiry-anchored at `ttlMs − marginMs` after the last cache-refreshing event. Still the stats partition threshold. Warns when `ttlMs <= intervalMs` (the fallback grid can never bridge the TTL) |
 | `providers.*.marginMs` | `60000` | safety buffer subtracted from `ttlMs`: anchored pings fire `marginMs` before the cache would die. Must be `< ttlMs` — a violating pair drops `ttlMs` (console warn) and the provider falls back to the `intervalMs` grid. Ignored when `ttlMs` is absent. |

@@ -7,6 +7,11 @@
 import assert from 'node:assert/strict'
 import { createWarmer } from '../lib/warmer.js'
 
+// Days are host-local (lib/journal.js localDayKey). The fixtures below are
+// written in UTC instants, so the suite pins the zone; the local-day
+// scenarios (74+) switch it explicitly and restore UTC afterwards.
+process.env.TZ = 'UTC'
+
 const fakeClock = () => {
   const state = { value: 0 }
   const pending = new Map()
@@ -867,7 +872,7 @@ const makeWarmer = (configOverrides = {}, journalOverrides = {}, depsOverrides =
 
 // --- 29. Stats harness + needless: quick follow-up makes the ping moot ------
 const { createStatsEngine } = await import('../lib/stats.js')
-const { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs')
+const { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs')
 const { tmpdir } = await import('node:os')
 const { join } = await import('node:path')
 
@@ -2697,6 +2702,80 @@ const gateTool = (warmer, sid = 's1') => {
     h.warmer.dispose()
   } finally {
     cleanupStats(h)
+  }
+}
+
+// --- 75. Journal budget: local midnight, dispatch-day counting, UTC-era lines --
+{
+  const { openJournal } = await import('../lib/journal.js')
+  process.env.TZ = 'Europe/Berlin'
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-localday-'))
+  try {
+    let nowMs = Date.UTC(2026, 9, 29, 22, 50) // 23:50 local Oct 29
+    const journal = openJournal(tmp, { now: () => nowMs })
+    journal.record({ ts: new Date(nowMs).toISOString(), counted: true })
+    assert.equal(journal.pingsToday(), 1)
+    const lateDispatch = new Date(Date.UTC(2026, 9, 29, 22, 59, 50)).toISOString() // 23:59:50 local
+    nowMs = Date.UTC(2026, 9, 29, 23, 10) // 00:10 local Oct 30 — UTC is still Oct 29
+    assert.equal(journal.pingsToday(), 0, 'the budget resets at LOCAL midnight')
+    journal.record({ ts: lateDispatch, counted: true })
+    assert.equal(journal.pingsToday(), 0, 'a ping dispatched before midnight counts on its dispatch day, even settling after it')
+    journal.close()
+    // A UTC-era line: stamped with the UTC day, dispatched after local midnight.
+    appendFileSync(join(tmp, 'warm.jsonl'), `${JSON.stringify({ ts: new Date(Date.UTC(2026, 9, 29, 23, 5)).toISOString(), counted: true, day: '2026-10-29' })}\n`)
+    const reopened = openJournal(tmp, { now: () => nowMs })
+    assert.equal(reopened.pingsToday(), 1, 'lines count by the local day of their ts, whatever basis stamped them')
+    const lines = readFileSync(join(tmp, 'warm.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.deepEqual(lines.slice(0, 2).map((l) => l.day), ['2026-10-29', '2026-10-29'], 'new lines stamp the local dispatch day')
+    reopened.close()
+  } finally {
+    process.env.TZ = 'UTC'
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 80. Journal: hosts sharing DSH_HOME share one daily budget --------------
+{
+  const { openJournal } = await import('../lib/journal.js')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-sharedbudget-'))
+  try {
+    const nowMs = Date.UTC(2026, 9, 29, 12, 0)
+    const ts = new Date(nowMs).toISOString()
+    const a = openJournal(tmp, { now: () => nowMs })
+    const b = openJournal(tmp, { now: () => nowMs })
+    a.record({ ts, counted: true })
+    a.record({ ts, counted: true })
+    b.record({ ts, counted: true })
+    b.record({ ts, counted: true })
+    b.record({ ts, counted: true })
+    assert.equal(a.pingsToday(), 5, 'host A sees host B\'s pings')
+    assert.equal(b.pingsToday(), 5, 'host B sees host A\'s pings')
+    a.record({ ts, counted: false })
+    assert.equal(b.pingsToday(), 5, 'uncounted lines never consume budget')
+    a.close()
+    b.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 81. Journal: a second roll the same day keeps the first rolled file ------
+{
+  const { openJournal } = await import('../lib/journal.js')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-roll2-'))
+  try {
+    const nowMs = Date.UTC(2026, 9, 17, 12, 0, 0)
+    const journal = openJournal(tmp, { now: () => nowMs })
+    const pad = 'p'.repeat(64 * 1024)
+    for (let i = 0; i < 180; i++) journal.record({ counted: true, pad })
+    assert.ok(existsSync(join(tmp, 'warm.jsonl.2026-10-17')), 'first roll')
+    assert.ok(existsSync(join(tmp, 'warm.jsonl.2026-10-17.1')), 'second roll gets its own name')
+    journal.close()
+    const reopened = openJournal(tmp, { now: () => nowMs })
+    assert.equal(reopened.pingsToday(), 180, 'every line of today is counted across both rolls and the live file')
+    reopened.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
   }
 }
 

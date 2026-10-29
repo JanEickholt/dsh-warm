@@ -145,7 +145,11 @@ window.__ModuleLoader__.load({
       return el('table', { className: 'dwf-tbl' },
         el('tbody', null, Object.entries(providers).map(([name, rule]) => el('tr', { key: name },
           el('td', { className: 'dwf-provider' }, name),
-          el('td', null, `${Math.round(rule.intervalMs / 1000)}s`),
+          // marginMs rides only anchored rules: their cadence is ttl − margin,
+          // and intervalMs is a fallback the schedule never reads.
+          el('td', null, typeof rule.marginMs === 'number'
+            ? `every ${Math.round((rule.ttlMs - rule.marginMs) / 1000)}s`
+            : `every ${Math.round(rule.intervalMs / 1000)}s (grid)`),
           el('td', null, `ttl ${Math.round(rule.ttlMs / 1000)}s`)))))
     }
 

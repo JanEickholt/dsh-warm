@@ -199,14 +199,14 @@ Approximations, by design: classification compares request/ping timestamps again
     }
   },
   "config": {
-    "providers": { "mistral": { "intervalMs": 240000, "ttlMs": 302000 } },
-    "budget": { "dailyPingBudget": 300, "maxPingsPerBlock": 5 },
+    "providers": { "mistral": { "intervalMs": 240000, "ttlMs": 302000, "marginMs": 60000 } },
+    "budget": { "dailyPingBudget": 300, "maxPingsPerBlock": 7 },
     "dryRun": false
   }
 }
 ```
 
-In `config.providers`, an entry that sets `maxPings` echoes it as a third, optional field.
+In `config.providers`, an entry that sets `maxPings` echoes it as an optional field, and an expiry-anchored rule (one with `ttlMs`) echoes `marginMs`: its real cadence is `ttlMs − marginMs`. A rule without `marginMs` runs on the `intervalMs` grid (its `ttlMs` then repeats `intervalMs`). Both fields are additive and optional, so the schema stays 3.
 
 The route sits behind the harness's authenticated `/api` fence (no separate auth; same fence as the harness's own routes) and exists whenever the plugin is enabled, also when stats are off, so the toggle state is visible.
 

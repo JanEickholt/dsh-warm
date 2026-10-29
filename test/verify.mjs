@@ -2462,8 +2462,8 @@ const gateTool = (warmer, sid = 's1') => {
 
     // The wire payload echoes the values actually in force, not the empty entry.
     const payload = makeStatsPayload(null, cfg)
-    assert.deepEqual(payload.config.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000 },
-      'the stats route echoes the adopted rule')
+    assert.deepEqual(payload.config.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 },
+      'the stats route echoes the adopted rule (marginMs: the rule is anchored)')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
@@ -2989,6 +2989,18 @@ const gateTool = (warmer, sid = 's1') => {
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
+}
+
+// --- 84. Route echoes marginMs for anchored rules only -------------------------
+{
+  const { makeStatsPayload } = await import('../lib/index.js')
+  const cfg = { ...baseConfig, providers: { mistral: { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 }, grid: { intervalMs: 180_000, marginMs: 60_000 } } }
+  const payload = makeStatsPayload(null, cfg)
+  assert.equal(payload.schema, 3, 'additive optional field: no schema bump')
+  assert.deepEqual(payload.config.providers.mistral, { intervalMs: 240_000, ttlMs: 302_000, marginMs: 60_000 })
+  assert.deepEqual(payload.config.providers.grid, { intervalMs: 180_000, ttlMs: 180_000 }, 'a grid rule carries no marginMs (its cadence is intervalMs)')
+  const source = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8')
+  assert.ok(source.includes('rule.ttlMs - rule.marginMs'), 'the client shows the anchored cadence, not the unread grid slot')
 }
 
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

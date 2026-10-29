@@ -106,7 +106,7 @@ A pre-table config (`warmProviders` + `intervalMs`) migrates automatically into 
 
 dsh-warm keeps its own ledger of what warming bought and what it wasted, independent of any other plugin. It shows up in three places: a `stats.json` file, a documented HTTP route, and a small client bundle.
 
-**Counters** (kept per UTC day and all-time; `failed` is all-time only):
+**Counters** (kept per host-local calendar day and all-time; `failed` is all-time only; `byDay` keeps the newest 366 days, `allTime` keeps the totals of older ones):
 
 | counter | meaning |
 | --- | --- |
@@ -115,7 +115,7 @@ dsh-warm keeps its own ledger of what warming bought and what it wasted, indepen
 | `noFollowup` | wasted: the tool block ended with no follow-up request at all (the turn went idle, or the session was disposed) |
 | `expired` | wasted: the follow-up needed the warm prefix but came more than TTL after the last successful ping, so the cache had already dropped |
 | `failed` | pings whose own request errored or aborted (counted separately, never as waste) |
-| `savedCacheTokens` | cache-read tokens of the last successful ping in a block whose follow-up was necessary (arrived past `t0 + TTL`: without any ping the cache would have dropped) and still held (within TTL of that ping), i.e. what warming verifiably bought |
+| `savedCacheTokens` | in a block whose follow-up was necessary (arrived past `t0 + TTL`: without any ping the cache would have dropped) and still held (within TTL of the last successful ping): the prefix that stayed warm the whole way, i.e. the smallest cache read among the block's successful pings — what warming verifiably bought. One full miss in the block credits nothing (that ping already paid the re-prefill the follow-up would have; later hits only moved the cost); a partial miss credits only what survived |
 | `models.*` | per-model slice of every counter above plus the token figures below; flat fields stay totals across models |
 | `pingCacheReadTokens` | per model, per outcome: the ping's own cache-read cost. `held` = necessary and the chain held — the cost that bought the credited follow-up; `needless`/`noFollowup`/`expired` = cost that bought nothing |
 | `pingUncachedTokens` | per model: the pings' uncached input tokens — the raw-price basis (cache misses pay here) |
@@ -134,7 +134,7 @@ dsh-warm ships tokens only — it holds no prices. Consumers price the story the
 
 For the dsh-context card's money legend: Saved = `savedCacheTokens` × miss price; Useful spend = `pingCacheReadTokens.held` × hit price; Wasted spend = waste-bucket `pingCacheReadTokens` + failed `failedPingTokens.cacheRead` (per-model; flat in the legacy fallback) × hit price; Full-price spend = `pingUncachedTokens` (+ per-model `failedPingTokens.uncached`) × miss price.
 
-Approximations, by design: classification compares request/ping timestamps against the configured `ttlMs`, not provider-side cache state. A ping that reported a miss (`cacheReadTokens` 0) is never credited. After a crash (no clean dispose) the boot reseeds `warms`/`failed` from `warm.jsonl` but leaves outcome counters at zero, because outcomes need the follow-up request that happened after the journal line. Of the token figures, per-model `pingUncachedTokens` and `failedPingTokens` reseed from the journal's recorded usage; only the per-outcome `pingCacheReadTokens` split stays zero with the counters. Usage a stream never surfaced counts as zero (failed pings too). A `stats.json` written before the per-model maps boots as-is: the absent maps start empty and the historical flat counts ride unchanged. The same holds per session: buckets count only post-upgrade attribution, a fresh boot reconstructs per-session `warms` from the journal's `sessionId`, and the recency timestamp behind the 50-session bound is internal — it never appears on the route. Stats are written to `storages/dsh-warm/stats.json` (atomic rename, UTC-day buckets).
+Approximations, by design: classification compares request/ping timestamps against the configured `ttlMs`, not provider-side cache state. A block containing a ping that reported a miss (`cacheReadTokens` 0) is never credited. After a crash (no clean dispose) the boot reseeds `warms`/`failed` from `warm.jsonl` but leaves outcome counters at zero, because outcomes need the follow-up request that happened after the journal line. Of the token figures, per-model `pingUncachedTokens` and `failedPingTokens` reseed from the journal's recorded usage; only the per-outcome `pingCacheReadTokens` split stays zero with the counters. Usage a stream never surfaced counts as zero (failed pings too). A `stats.json` written before the per-model maps boots as-is: the absent maps start empty and the historical flat counts ride unchanged. The same holds per session: buckets count only post-upgrade attribution, a fresh boot reconstructs per-session `warms` from the journal's `sessionId`, and the recency timestamp behind the 50-session bound is internal — it never appears on the route. Stats are written to `storages/dsh-warm/stats.json` (atomic rename, local-day buckets; a file from the UTC-keyed era loads as-is — same key format, only the boundary hours of that day land on the neighboring date).
 
 **Diagnosing counts:** set `"debug": true` and restart the harness; every observed `llm/stream`, tool window, ping, and chain partition is then appended to `storages/dsh-warm/debug.jsonl`, which shows exactly which event an outcome bucket missed (the trace rolls to `debug.jsonl.1` past 16 MB, so at most two bounded files stay on disk). Each `chain.close` carries the two numbers the partition compares — `gap` (follow-up minus the block's opening request) and `ttl`. Turn it off when done.
 
@@ -214,8 +214,8 @@ The route sits behind the harness's authenticated `/api` fence (no separate auth
 
 ## Observability
 
-- `storages/dsh-warm/warm.jsonl` holds one line per ping: provider usage (`cacheReadTokens` > 0 means a hit), latency, errors, dry-run markers. It rolls at 5 MB, and the budget counter boots from today's lines.
-- `storages/dsh-warm/stats.json` holds the stats counters above (see Stats), atomic-written, resilient to crashes.
+- `storages/dsh-warm/warm.jsonl` holds one line per ping: provider usage (`cacheReadTokens` > 0 means a hit), latency, errors, dry-run markers. It rolls at 5 MB into `warm.jsonl.<day>` (a second roll the same day gets `.<day>.1`, never replacing the first), and the budget counter boots from today's lines — a line counts on the local day of its dispatch `ts`.
+- `storages/dsh-warm/stats.json` holds the stats counters above (see Stats), atomic-written, resilient to crashes. Hosts sharing one `$DSH_HOME` merge into it: every write re-reads the file under `stats.json.lock` and adds only its own increments, so no host's counts overwrite another's (a lock whose owner died, or older than 10 s, is broken).
 - Host console: a load banner with the resolved config, plus rate-limited failure warnings.
 - dsh-cost-meter's ledger includes every ping (session-attributed via `sessionId`), so the economics stay verifiable against reality.
 

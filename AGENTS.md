@@ -148,7 +148,17 @@ covers what it does and why; this file covers what silently breaks.
   per-model `models` maps, all-time flat `failedPingTokens`, and the
   bounded `sessions` map; flat count fields are complete totals in the
   same sense (pre-upgrade rows can widen a flat-vs-models gap; only
-  post-upgrade increments are guaranteed to match).
+  post-upgrade increments are guaranteed to match). `config.providers.*`
+  carries optional `maxPings` and (anchored rules only) `marginMs`;
+  additive optional fields there need no bump — dsh-context reads only
+  `stats` and rejects unknown schema numbers, so a bump breaks it.
+- stats.json persistence is a merge (lib/stats.js): every write takes
+  `stats.json.lock`, re-reads the file, adds `stats − base` (this
+  engine's increments since its last reconcile; `lastAt` max), writes via
+  a per-pid temp, and adopts the result as the new base. `today` is never
+  merged — it is derived from `byDay[today]`. A mutation that is not a
+  monotonic increment (anything besides `+=` on a leaf) would be lost by
+  the delta rule; prune only on the merged result (sessions, byDay).
 - Client smoke test (scenario 46) evaluates the factory with a stubbed
   `require('react')` and a mock slots service — react is NOT a repo
   dependency and must never become one.

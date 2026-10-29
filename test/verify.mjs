@@ -1760,7 +1760,7 @@ const gateTool = (warmer, sid = 's1') => {
     assert.equal(agg.warms, 3)
     assert.equal(agg.needless, 0)
     assert.equal(agg.noFollowup, 1)
-    assert.equal(agg.savedCacheTokens, 1152, 'the follow-up credits the held chain\'s last hit')
+    assert.equal(agg.savedCacheTokens, 0, 'the miss already paid the re-prefill the follow-up would have: the later hit moved the cost, it saved none')
     const model = agg.models['zai-glm-5-3']
     assert.deepEqual(model.pingCacheReadTokens, { held: 1152, needless: 0, noFollowup: 1152, expired: 0 },
       'each ping\'s cache-read cost lands in its own outcome bucket')
@@ -1777,10 +1777,10 @@ const gateTool = (warmer, sid = 's1') => {
     assert.equal(wire.today.noFollowup, 1)
     assert.deepEqual(wire.failedPingTokens, { cacheRead: 0, uncached: 0 })
     assert.deepEqual(wire.sessions.s1, {
-      warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152,
+      warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 0,
       models: {
         'zai-glm-5-3': {
-          warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 1152,
+          warms: 3, needless: 0, noFollowup: 1, expired: 0, savedCacheTokens: 0,
           pingCacheReadTokens: { held: 1152, needless: 0, noFollowup: 1152, expired: 0 },
           pingUncachedTokens: 7400,
           failedPingTokens: { cacheRead: 0, uncached: 0 },
@@ -2705,6 +2705,31 @@ const gateTool = (warmer, sid = 's1') => {
   }
 }
 
+// --- 74. Stats bucket by the host-local day, not the UTC day ----------------
+{
+  process.env.TZ = 'Europe/Berlin'
+  const h = statsHarness()
+  try {
+    h.clock.advance(Date.UTC(2026, 9, 29, 23, 30)) // 00:30 on Oct 30 in Berlin (CET), still Oct 29 in UTC
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const tool = gateTool(h.warmer)
+    h.clock.advance(242_000)
+    await settle()
+    const snap = h.stats.snapshot()
+    assert.equal(snap.today.day, '2026-10-30', 'today is the local calendar day')
+    assert.match(snap.today.day, /^\d{4}-\d{2}-\d{2}$/, 'dsh-context DAY_RE format kept')
+    assert.deepEqual(Object.keys(snap.byDay), ['2026-10-30'], 'byDay keys are local days')
+    assert.equal(snap.today.warms, 1)
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    process.env.TZ = 'UTC'
+    cleanupStats(h)
+  }
+}
+
 // --- 75. Journal budget: local midnight, dispatch-day counting, UTC-era lines --
 {
   const { openJournal } = await import('../lib/journal.js')
@@ -2730,6 +2755,138 @@ const gateTool = (warmer, sid = 's1') => {
     reopened.close()
   } finally {
     process.env.TZ = 'UTC'
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 76. A UTC-keyed stats.json from before the switch loads and continues ---
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-utcfile-'))
+  const warnings = []
+  try {
+    const t1 = Date.UTC(2026, 9, 29, 10, 0)
+    const old = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t1, warn: () => {} })
+    old.onRealRequest('s1', 'mistral')
+    old.onPingDispatch('s1', 'zai-glm-5-3')
+    old.dispose()
+    process.env.TZ = 'Europe/Berlin'
+    const t2 = Date.UTC(2026, 9, 29, 12, 0) // 13:00 local: the same calendar day under both bases
+    const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t2, warn: (m) => warnings.push(m) })
+    assert.equal(warnings.length, 0, 'the UTC-keyed file is shape-valid: no reseed')
+    assert.equal(engine.snapshot().today.warms, 1, 'today continues across the basis switch')
+    engine.onRealRequest('s1', 'mistral')
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    const snap = engine.snapshot()
+    assert.equal(snap.today.warms, 2)
+    assert.equal(snap.byDay['2026-10-29'].warms, 2, 'increments land on the same key')
+    assert.equal(snap.allTime.warms, 2)
+    engine.dispose()
+  } finally {
+    process.env.TZ = 'UTC'
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 77. Partial miss inside a necessary chain credits only what survived ----
+{
+  const readsLlm = () => {
+    const dispatches = []
+    const reads = [1152, 600, 1152]
+    const llm = {
+      stream: async function* (options) {
+        const read = reads[dispatches.length] ?? 1152
+        dispatches.push(options)
+        yield { type: 'usage', usage: { inputTokens: 1200 - read + 48, cacheReadTokens: read, outputTokens: 1 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }
+    return { llm, dispatches }
+  }
+  const h = statsHarness({}, readsLlm)
+  try {
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const tool = gateTool(h.warmer)
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(242_000)
+      await settle()
+    }
+    h.clock.advance(220_000)
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const agg = h.stats.snapshot().allTime
+    assert.equal(h.dispatches.length, 3)
+    assert.equal(agg.savedCacheTokens, 600, 'saved = the prefix warm the whole way (min read), not the last ping\'s 1152')
+    assert.equal(agg.expired, 0, 'still held: the pings are useful, the credit is just honest')
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
+// --- 78. Two hosts sharing stats.json: merge on write, no lost updates -------
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-merge-'))
+  try {
+    const t = Date.UTC(2026, 9, 29, 10, 0)
+    const a = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: () => {} })
+    const b = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: () => {} })
+    a.onRealRequest('sa', 'mistral')
+    a.onPingDispatch('sa', 'zai-glm-5-3')
+    b.onRealRequest('sb', 'mistral')
+    b.onPingDispatch('sb', 'zai-glm-5-3')
+    a.onPingDispatch('sa', 'zai-glm-5-3')
+    const disk = JSON.parse(readFileSync(join(tmp, 'stats.json'), 'utf8'))
+    assert.equal(disk.allTime.warms, 3, 'every host\'s increments reach the file (last writer no longer wins)')
+    assert.equal(disk.allTime.models['zai-glm-5-3'].warms, 3, 'per-model leaves merge too')
+    assert.equal(disk.byDay['2026-10-29'].warms, 3)
+    assert.equal(disk.today.warms, 3, 'today is re-derived from byDay')
+    assert.deepEqual([disk.sessions.sa.warms, disk.sessions.sb.warms], [2, 1], 'both hosts\' sessions survive')
+    assert.equal(a.snapshot().allTime.warms, 3, 'a snapshot sees the sibling\'s writes')
+    assert.equal(b.snapshot().allTime.warms, 3)
+    a.dispose()
+    b.dispose()
+    const reboot = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: () => {} })
+    assert.equal(reboot.snapshot().allTime.warms, 3, 'disposal writes add nothing twice')
+    reboot.dispose()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 79. stats.json.lock: a live holder defers, a dead or old one is broken --
+{
+  const { spawnSync } = await import('node:child_process')
+  const { utimesSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-lock-'))
+  const warnings = []
+  try {
+    const t = Date.UTC(2026, 9, 29, 10, 0)
+    const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: (m) => warnings.push(m) })
+    const lock = join(tmp, 'stats.json.lock')
+    const fileWarms = () => JSON.parse(readFileSync(join(tmp, 'stats.json'), 'utf8')).allTime.warms
+    engine.onRealRequest('s1', 'mistral')
+    writeFileSync(lock, `${process.ppid}\n`) // a live sibling mid-write
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    assert.equal(fileWarms(), 0, 'a live lock defers the write')
+    assert.equal(warnings.filter((m) => m.includes('busy')).length, 1, 'one warning')
+    assert.equal(engine.snapshot().allTime.warms, 1, 'the deferred increment is kept, not lost')
+    rmSync(lock)
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    assert.equal(fileWarms(), 2, 'the next write carries the deferred increment too')
+    const dead = spawnSync(process.execPath, ['-e', '']).pid
+    writeFileSync(lock, `${dead}\n`)
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    assert.equal(fileWarms(), 3, 'a lock whose owner died is broken')
+    assert.ok(!existsSync(lock), 'and released after the write')
+    writeFileSync(lock, `${process.ppid}\n`)
+    const old = (Date.now() - 60_000) / 1000
+    utimesSync(lock, old, old)
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    assert.equal(fileWarms(), 4, 'a lock older than any real write is broken')
+    engine.dispose()
+  } finally {
     rmSync(tmp, { recursive: true, force: true })
   }
 }
@@ -2774,6 +2931,33 @@ const gateTool = (warmer, sid = 's1') => {
     const reopened = openJournal(tmp, { now: () => nowMs })
     assert.equal(reopened.pingsToday(), 180, 'every line of today is counted across both rolls and the live file')
     reopened.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// --- 82. byDay is bounded to the newest 366 days; allTime keeps the totals ---
+{
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-days-'))
+  try {
+    const t = Date.UTC(2026, 9, 29, 10, 0)
+    const first = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: () => {} })
+    first.dispose()
+    const file = JSON.parse(readFileSync(join(tmp, 'stats.json'), 'utf8'))
+    const bucket = { warms: 1, needless: 0, noFollowup: 0, expired: 0, savedCacheTokens: 0, models: {} }
+    for (let i = 1; i <= 370; i++) file.byDay[new Date(t - i * 86_400_000).toISOString().slice(0, 10)] = { ...bucket }
+    file.allTime.warms = 370
+    writeFileSync(join(tmp, 'stats.json'), JSON.stringify(file))
+    const engine = createStatsEngine({ storageDir: tmp, config: baseConfig, now: () => t, warn: () => {} })
+    engine.onRealRequest('s1', 'mistral')
+    engine.onPingDispatch('s1', 'zai-glm-5-3')
+    const disk = JSON.parse(readFileSync(join(tmp, 'stats.json'), 'utf8'))
+    const days = Object.keys(disk.byDay).sort()
+    assert.equal(days.length, 366, 'byDay keeps the newest 366 days')
+    assert.equal(days.at(-1), '2026-10-29', 'today survives')
+    assert.equal(days[0], new Date(t - 365 * 86_400_000).toISOString().slice(0, 10), 'the oldest days go first')
+    assert.equal(disk.allTime.warms, 371, 'allTime keeps pruned days\' totals')
+    engine.dispose()
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

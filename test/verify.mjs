@@ -2577,4 +2577,34 @@ const gateTool = (warmer, sid = 's1') => {
   }
 }
 
+// --- 69. Journal: a ping settling after close() lands without leaking an fd ---
+// Teardown closes the journal while a ping may still be in flight; its settle
+// journals afterwards (budget honesty). It used to reopen a handle nobody ever
+// closed — one leaked fd per hot-reload with a ping in flight.
+{
+  const { openJournal } = await import('../lib/journal.js')
+  const { readdirSync } = await import('node:fs')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-close-'))
+  const fdCount = () => (existsSync('/proc/self/fd') ? readdirSync('/proc/self/fd').length : null)
+  try {
+    const nowMs = Date.UTC(2026, 9, 29, 12, 0, 0)
+    const journal = openJournal(tmp, { now: () => nowMs })
+    journal.record({ counted: true, n: 1 })
+    journal.close()
+    const before = fdCount()
+    journal.record({ counted: true, n: 2 })
+    journal.record({ counted: true, n: 3 })
+    if (before !== null) assert.equal(fdCount(), before, 'records after close() hold no file descriptor open')
+    const lines = readFileSync(join(tmp, 'warm.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.deepEqual(lines.map((l) => l.n), [1, 2, 3], 'late settles still land in the journal')
+    assert.equal(journal.pingsToday(), 3, 'and still count against the budget')
+    journal.close()
+    const reopened = openJournal(tmp, { now: () => nowMs })
+    assert.equal(reopened.pingsToday(), 3, 'the next boot counts the late lines')
+    reopened.close()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

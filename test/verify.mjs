@@ -2677,4 +2677,27 @@ const gateTool = (warmer, sid = 's1') => {
   warmer.dispose()
 }
 
+// --- 73. stats.json temp is per-process: a sibling host's temp is untouched ---
+{
+  const h = statsHarness()
+  try {
+    const foreign = join(h.tmp, 'stats.json.tmp')
+    writeFileSync(foreign, '{"half-written": ')
+    h.warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    h.warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const tool = gateTool(h.warmer)
+    h.clock.advance(242_000)
+    await settle()
+    assert.equal(readFileSync(foreign, 'utf8'), '{"half-written": ', 'another writer\'s temp file is never truncated or renamed')
+    const onDisk = JSON.parse(readFileSync(join(h.tmp, 'stats.json'), 'utf8'))
+    assert.equal(onDisk.allTime.warms, 1, 'stats.json is still written atomically')
+    assert.ok(!existsSync(join(h.tmp, `stats.json.${process.pid}.tmp`)), 'no own temp left behind')
+    tool.gate.resolve()
+    await tool.promise
+    h.warmer.dispose()
+  } finally {
+    cleanupStats(h)
+  }
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')

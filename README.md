@@ -46,7 +46,7 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
 {
   "enabled": true,
   "dryRun": false,
-  "maxPings": 5,
+  "maxPings": 7,
   "providers": {
     "mistral":   { "intervalMs": 240000, "ttlMs": 302000, "marginMs": 60000 },
     "openai":    { "intervalMs": 240000, "ttlMs": 300000, "marginMs": 60000 },
@@ -66,7 +66,7 @@ The plugin's `dsh.bundle.patch` (`cordis.patch.yml`) inserts the loader row auto
 | `enabled` | `true` | master switch |
 | `dryRun` | `false` | journal would-be pings, dispatch nothing. Watch mode for a first deploy. |
 | `providers` | see above | **presence in the table = warm this provider**; each entry may set `intervalMs`, `ttlMs` (expiry-anchored scheduling), `marginMs`, and `maxPings`. An entry left `{}` for a known provider adopts the built-in rule (console warn); a `ttlMs`-only entry is kept with `intervalMs` defaulted to 240000 (only the fallback grid reads it); unknown names with neither field warn + drop |
-| `maxPings` | `5` | ping cap per tool block when a provider entry doesn't override it (the prefix goes stale after `maxPings` refreshes anyway) |
+| `maxPings` | `7` | ping cap per tool block when a provider entry doesn't override it. 7 anchored pings (242 s apart) hold the cache up to 7 × 242 + 302 = 1996 s, which covers a 30-min tool wait; at the former 5 (cover 1512 s) every ping of the live ledger's ~30-min blocks expired. An existing `config.json` keeps whatever value it was written with |
 | `excludeTools` | `["ask_user_question"]` | user-idle-like waits with uncertain resume |
 | `minPrefixChars` | `12000` | skip tiny prefixes (≈chars/4 tokens); preventing a miss on them is not worth a ping |
 | `maxConcurrentPings` | `2` | global in-flight guard; over-cap pings retry in 5 s without consuming a slot |

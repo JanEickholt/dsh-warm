@@ -2963,4 +2963,32 @@ const gateTool = (warmer, sid = 's1') => {
   }
 }
 
+// --- 83. Default maxPings is 7: a 30-min block keeps its cover ---------------
+{
+  const { loadConfig } = await import('../lib/config.js')
+  const tmp = mkdtempSync(join(tmpdir(), 'dsh-warm-maxpings-'))
+  try {
+    const cfg = loadConfig(tmp, () => {})
+    assert.equal(cfg.maxPings, 7, 'default cap is 7')
+    assert.equal(JSON.parse(readFileSync(join(tmp, 'config.json'), 'utf8')).maxPings, 7, 'the auto-written config.json carries 7')
+    const { warmer, clock, dispatches } = makeWarmer({ maxPings: cfg.maxPings })
+    warmer.onAgentStatus({ agent: { id: 's1' }, status: 'running' })
+    warmer.onLlmStream(conversationRequest, () => [])[Symbol.iterator]()
+    const gate = { resolve: null }
+    const toolPromise = warmer.onToolsExecute({ agent: { id: 's1' }, name: 'bash' }, async () => { await new Promise((r) => { gate.resolve = r }); return 'ok' })
+    for (let i = 0; i < 9; i++) {
+      clock.advance(242_000)
+      await settle()
+    }
+    assert.equal(dispatches.length, 7, 'seven anchored pings, then the cap')
+    // Cover: last ping at 7 × 242 s = 1694 s, held until 1694 + 302 = 1996 s ≥ a 30-min (1800 s) block.
+    assert.ok(7 * 242 + 302 >= 1800)
+    gate.resolve()
+    await toolPromise
+    warmer.dispose()
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 console.log('dsh-warm test/verify.mjs: all scenarios passed')
